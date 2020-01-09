@@ -24,8 +24,7 @@ in modern C++, making use of data structures in the standard library.
 ## Versioning
 
 Osm2pgsql uses a X.Y.Z version number, where Y tells you if you are on a stable
-or development series. Like the Linux Kernel, even numbers are stable and
-development versions are odd.
+or development series. Even numbers are stable and development versions are odd.
 
 Bugs and known issues are fixed on the main branch only. Exceptions may be made
 for easy bug fixes, or if a patch backporting a fix is provided.
@@ -47,9 +46,9 @@ There is a .clang-format configuration avialable and all code must be run throug
 clang-format before submitting. You can use git-clang-format after staging all
 your changes:
 
-    git-clang-format --style=file *pp tests/*pp
+    git-clang-format src/*pp tests/*pp
 
-clang-format 3.8 or later is required.
+clang-format 7 or later is required.
 
 ## Documentation
 
@@ -57,7 +56,7 @@ User documentation is stored in `docs/`. Pages on the OpenStreetMap wiki are
 known to be unreliable and outdated.
 
 There is some documentation in Doxygen-formatted comments. The documentation can
-be generated with ``doxygen docs/Doxyfile``. It is not yet hooked into the build
+be generated with `doxygen docs/Doxyfile`. It is not yet hooked into the build
 scripts as most functions are not yet documented.
 
 ## Platforms targeted
@@ -67,28 +66,31 @@ actively tested on Debian, Ubuntu and FreeBSD by the maintainers.
 
 ## Testing
 
-The code also comes with a suite of tests which can be run by
-executing ``ctest``.
+The code comes with a suite of tests. They are only compiled and run when
+`BUILD_TESTS=ON` is set in the CMake config.
+
+Tests are executed by calling `ctest`. You can call `ctest` with `-L NoDB` to
+only run tests that don't need a database.
 
 Regression tests require python and psycopg to be installed. On Ubuntu run:
 
 ```sh
-sudo apt-get install python-psycopg2
+sudo apt-get install python3-psycopg2
 ```
 
 Most of these tests depend on being able to set up a database and run osm2pgsql
-against it. This is most easily done using ``pg_virtualenv``. Just run
+against it. This is most easily done using `pg_virtualenv`. Just run
 
 ```sh
 pg_virtualenv ctest
 ```
 
-``pg_virtualenv`` creates a separate postgres server instance. The test databases
+`pg_virtualenv` creates a separate postgres server instance. The test databases
 are created in this instance and the complete server is destroyed after the
 tests are finished. ctest also calls appropriate fixtures that create the
 separate tablespace required for some tests.
 
-When running without ``pg_virtualenv``, you need to ensure that PostgreSQL is
+When running without `pg_virtualenv`, you need to ensure that PostgreSQL is
 running and that your user is a superuser of that system. You also need to
 create an appropriate test tablespace manually. To do that, run:
 
@@ -99,12 +101,17 @@ sudo chown postgres.postgres /tmp/psql-tablespace
 psql -c "CREATE TABLESPACE tablespacetest LOCATION '/tmp/psql-tablespace'" postgres
 ```
 
-Once this is all set up, all the tests should run (no SKIPs), and pass
-(no FAILs). If you encounter a failure, you can find more information
-by looking in the `test-suite.log`. If you find something which seems
-to be a bug, please check to see if it is a known issue at
-https://github.com/openstreetmap/osm2pgsql/issues and, if it's not
-already known, report it there.
+Once this is all set up, all the tests should run (no SKIPs), and pass (no
+FAILs). If you find something which seems to be a bug, please check to see if
+it is a known issue at https://github.com/openstreetmap/osm2pgsql/issues and,
+if it's not already known, report it there.
+
+If you have failing tests and want to look at the test database to figure out
+what's happening, you can set the environment variable `OSM2PGSQL_KEEP_TEST_DB`
+to anything. This will disable the database cleanup at the end of the test.
+This will often be used together with the `-s` option of `pg_virtualenv` which
+drops you into a shell after a failed test where you can still access the
+database created by `pg_virtualenv`.
 
 ### Performance Testing
 

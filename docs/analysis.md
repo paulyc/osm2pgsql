@@ -3,22 +3,22 @@
 An osm2pgsql database and PostGIS is well-suited for geospatial analysis using
 OpenStreetMap data where topology is not a consideration.
 
-PostGIS provides an [extensive number of geometry functions](http://postgis.net/docs/manual-2.1/reference.html)
+PostGIS provides an [extensive number of geometry functions](http://postgis.net/docs/manual-2.5/reference.html)
 and a full description of how to perform analysis with them is beyond the
 scope of a readme, but a simple example of finding the total road lengths by
 classification for a municipality should help.
 
-To start with, we'll download the data for the region as an [extract from Geofabrik](http://download.geofabrik.de/) and import it with osm2pgsql.
+To start with, we'll download the data for the region as an [extract from Geofabrik](https://download.geofabrik.de/) and import it with osm2pgsql.
 
     osm2pgsql --database gis --number-processes 4 --multi-geometry british-columbia-latest.osm.pbf
 
-``--multi-geometry`` (``-G``) is necessary for most analysis as it prevents
+`--multi-geometry` (`-G`) is necessary for most analysis as it prevents
 MULTIPOLYGONs from being split into multiple POLYGONs, a step that is
 normally used to [increase rendering speed](http://paulnorman.ca/blog/2014/03/osm2pgsql-multipolygons)
 but increases the complexity of analysis SQL.
 
 Loading should take about 10 minutes, depending on computer speed. Once this
-is done we'll open a PostgreSQL terminal with ``psql -d gis``, although a GUI
+is done we'll open a PostgreSQL terminal with `psql -d gis`, although a GUI
 like pgadmin or any standard tool could be used instead.
 
 To start, we'll create a partial index to speed up highway queries.
@@ -42,8 +42,8 @@ on [the OpenStreetMap site](https://www.openstreetmap.org/relation/1377803)
 confirms which it is.
 
 We want to find all the roads in the city and get the length of the portion in
-the city, sorted by road classification. Roads are in the ``planet_osm_line``
-table, not the ``planet_osm_roads`` table which is only has a subset of data
+the city, sorted by road classification. Roads are in the `planet_osm_line`
+table, not the `planet_osm_roads` table which is only has a subset of data
 for low-zoom rendering.
 
 ```sql
@@ -73,7 +73,7 @@ gis=# SELECT
               3728 | track
 ```
 
-The ``ST_Transform(...,4326)::geography`` is necessary because the data was
+The `ST_Transform(...,4326)::geography` is necessary because the data was
 imported in Mercator. This step could have been avoided by importing in a local
 projection like a suitable UTM projection.
 

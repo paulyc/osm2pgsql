@@ -1,112 +1,143 @@
-#ifndef COMMON_PG_HPP
-#define COMMON_PG_HPP
+#ifndef OSM2PGSQL_TEST_COMMON_PG_HPP
+#define OSM2PGSQL_TEST_COMMON_PG_HPP
 
+#include <cstdio>
+#include <cstdlib>
+#include <stdexcept>
 #include <string>
-#include <memory>
-#include <boost/format.hpp>
-#include <boost/noncopyable.hpp>
-#include <libpq-fe.h>
 
-// reuse the database_options_t class
+#include <boost/lexical_cast.hpp>
+
+#include "format.hpp"
 #include "options.hpp"
+#include "pgsql.hpp"
+#include <catch.hpp>
 
-/* Some RAII objects to make writing stuff that needs a temporary database
- * easier, and to keep track of and free connections and results objects.
- */
+#ifdef _MSC_VER
+#include <process.h>
+#include <windows.h>
+#define getpid _getpid
+#endif
+
+/// Helper classes for postgres connections
 namespace pg {
 
-struct conn;
-struct result;
+class conn_t : public pg_conn_t
+{
+public:
+    conn_t(std::string const &conninfo) : pg_conn_t(conninfo) {}
 
-typedef std::shared_ptr<conn> conn_ptr;
-typedef std::shared_ptr<result> result_ptr;
+    template <typename T>
+    T require_scalar(std::string const &cmd) const
+    {
+        pg_result_t const res = query(PGRES_TUPLES_OK, cmd);
+        REQUIRE(res.num_tuples() == 1);
 
-struct conn
-    : public boost::noncopyable,
-      public std::enable_shared_from_this<conn> {
+        auto const str = res.get_value_as_string(0, 0);
+        return boost::lexical_cast<T>(str);
+    }
 
-    static conn_ptr connect(const std::string &conninfo);
-    static conn_ptr connect(const database_options_t &database_options);
-    result_ptr exec(const std::string &query);
-    result_ptr exec(const boost::format &fmt);
-    PGconn *get();
+    void assert_double(double expected, std::string const &cmd) const
+    {
+        REQUIRE(Approx(expected).epsilon(0.01) == require_scalar<double>(cmd));
+    }
 
-    ~conn();
+    void assert_null(std::string const &cmd) const
+    {
+        pg_result_t const res = query(PGRES_TUPLES_OK, cmd);
+        REQUIRE(res.num_tuples() == 1);
+        REQUIRE(res.is_null(0, 0));
+    }
 
-private:
-    conn(const std::string &conninfo);
+    pg_result_t require_row(std::string const &cmd) const
+    {
+        pg_result_t res = query(PGRES_TUPLES_OK, cmd);
+        REQUIRE(res.num_tuples() == 1);
 
-    PGconn *m_conn;
+        return res;
+    }
+
+    unsigned long get_count(char const *table_name,
+                            std::string const &where = "") const
+    {
+        auto const query = "SELECT count(*) FROM {} {} {}"_format(
+            table_name, (where.empty() ? "" : "WHERE"), where);
+
+        return require_scalar<unsigned long>(query);
+    }
+
+    void require_has_table(char const *table_name) const
+    {
+        auto const where = "oid = '{}'::regclass"_format(table_name);
+
+        REQUIRE(get_count("pg_catalog.pg_class", where) == 1);
+    }
 };
 
-struct result
-  : public boost::noncopyable {
-    result(conn_ptr conn, const std::string &query);
-    PGresult *get();
-    ~result();
+class tempdb_t
+{
+public:
+    tempdb_t() noexcept
+    {
+        try {
+            conn_t conn("dbname=postgres");
+
+            m_db_name = "osm2pgsql-test-{}-{}"_format(getpid(), time(nullptr));
+            conn.exec("DROP DATABASE IF EXISTS \"{}\""_format(m_db_name));
+            conn.exec("CREATE DATABASE \"{}\" WITH ENCODING 'UTF8'"_format(
+                m_db_name));
+
+            conn_t local = connect();
+            local.exec("CREATE EXTENSION postgis");
+            local.exec("CREATE EXTENSION hstore");
+        } catch (std::runtime_error const &e) {
+            fprintf(stderr, "Test database cannot be created: %s\n", e.what());
+            fprintf(stderr, "Did you mean to run 'pg_virtualenv ctest'?\n");
+            exit(1);
+        }
+    }
+
+    tempdb_t(tempdb_t const &) = delete;
+    tempdb_t &operator=(tempdb_t const &) = delete;
+
+    tempdb_t(tempdb_t &&) = delete;
+    tempdb_t &operator=(tempdb_t const &&) = delete;
+
+    ~tempdb_t() noexcept
+    {
+        if (!m_db_name.empty()) {
+            // Disable removal of the test database by setting the environment
+            // variable OSM2PGSQL_KEEP_TEST_DB to anything. This can be useful
+            // when debugging tests.
+            const char *const keep_db = std::getenv("OSM2PGSQL_KEEP_TEST_DB");
+            if (keep_db != nullptr) {
+                return;
+            }
+            try {
+                conn_t conn{"dbname=postgres"};
+                conn.exec("DROP DATABASE IF EXISTS \"{}\""_format(m_db_name));
+            } catch (...) {
+                fprintf(stderr, "DROP DATABASE failed. Ignored.\n");
+            }
+        }
+    }
+
+    conn_t connect() const { return conn_t{conninfo()}; }
+
+    std::string conninfo() const { return "dbname=" + m_db_name; }
+
+    database_options_t db_options() const
+    {
+        database_options_t opt;
+        opt.db = m_db_name;
+
+        return opt;
+    }
 
 private:
-    conn_ptr m_conn;
-    PGresult *m_result;
-};
-
-struct tempdb
-  : public boost::noncopyable {
-
-    tempdb();
-    ~tempdb();
-
-    static std::unique_ptr<pg::tempdb> create_db_or_skip();
-
-    database_options_t database_options;
-
-    void check_tblspc();
-    /**
-     * Checks the result of a query with COUNT(*).
-     * It will work with any integer-returning query.
-     * \param[in] expected expected result
-     * \param[in] query SQL query to run. Must return one tuple.
-     * \throws std::runtime_error if query result is not expected
-     */
-    void check_count(int expected, const std::string &query);
-
-    /**
-     * Checks a floating point number.
-     * It allows a small variance around the expected result to allow for
-     * floating point differences.
-     * The query must only return one tuple
-     * \param[in] expected expected result
-     * \param[in] query SQL query to run. Must return one tuple.
-     * \throws std::runtime_error if query result is not expected
-     */
-    void check_number(double expected, const std::string &query);
-
-    /**
-     * Check the string a query returns.
-     * \param[in] expected expected result
-     * \param[in] query SQL query to run. Must return one tuple.
-     * \throws std::runtime_error if query result is not expected
-     */
-    void check_string(const std::string &expected, const std::string &query);
-    /**
-     * Assert that the database has a certain table_name
-     * \param[in] table_name Name of the table to check, optionally schema-qualified
-     * \throws std::runtime_error if missing the table
-     */
-    void assert_has_table(const std::string &table_name);
-
-private:
-    /**
-     * Sets up an extension, trying first with 9.1 CREATE EXTENSION, and falling
-     * back to trying to find extension_files. The fallback is not likely to
-     * work on systems not based on Debian.
-     */
-    void setup_extension(const std::string &extension, const std::vector<std::string> &extension_files = std::vector<std::string>());
-
-    conn_ptr m_conn; ///< connection to the test DB
-    conn_ptr m_postgres_conn; ///< Connection to the "postgres" db, used to create and drop test DBs
+    std::string m_db_name;
 };
 
 } // namespace pg
 
-#endif /* COMMON_PG_HPP */
+#endif // OSM2PGSQL_TEST_COMMON_PG_HPP

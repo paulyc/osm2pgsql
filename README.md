@@ -4,6 +4,10 @@ osm2pgsql is a tool for loading OpenStreetMap data into a PostgreSQL / PostGIS
 database suitable for applications like rendering into a map, geocoding with
 Nominatim, or general analysis.
 
+[![Travis Build Status](https://secure.travis-ci.org/openstreetmap/osm2pgsql.svg?branch=master)](https://travis-ci.org/openstreetmap/osm2pgsql)
+[![Appveyor Build status](https://ci.appveyor.com/api/projects/status/7abwls7hfmb83axj/branch/master?svg=true)](https://ci.appveyor.com/project/openstreetmap/osm2pgsql/branch/master)
+[![Packaging status](https://repology.org/badge/tiny-repos/osm2pgsql.svg)](https://repology.org/project/osm2pgsql/versions)
+
 ## Features ##
 
 * Converts OSM files to a PostgreSQL DB
@@ -12,17 +16,16 @@ Nominatim, or general analysis.
 * Can apply diffs to keep the database up to date
 * Support the choice of output projection
 * Configurable table names
-* Gazetteer back-end for [Nominatim](http://wiki.openstreetmap.org/wiki/Nominatim)
+* Gazetteer back-end for [Nominatim](https://wiki.openstreetmap.org/wiki/Nominatim)
 * Support for hstore field type to store the complete set of tags in one database
   field if desired
 
 ## Installing ##
 
-Most Linux distributions include osm2pgsql. It is also available on macOS with [Homebrew](http://brew.sh/).
+Most Linux distributions include osm2pgsql. It is also available on macOS with [Homebrew](https://brew.sh/).
 
 Unoffical builds for Windows are available from [AppVeyor](https://ci.appveyor.com/project/openstreetmap/osm2pgsql/history) but you need to find the right build artifacts.
-For the latest release 0.96.0, you may download a
-[32bit version](https://ci.appveyor.com/api/projects/openstreetmap/osm2pgsql/artifacts/osm2pgsql_Release_x86.zip?tag=0.96.0&job=Environment%3A%20arch%3Dx86) or [64bit version](https://ci.appveyor.com/api/projects/openstreetmap/osm2pgsql/artifacts/osm2pgsql_Release_x64.zip?tag=0.96.0&job=Environment%3A%20arch%3Dx64).
+Builds for releases may also be downloaded from the [OpenStreetMap Dev server](https://lonvia.dev.openstreetmap.org/osm2pgsql-winbuild/releases/).
 
 ## Building ##
 
@@ -38,22 +41,23 @@ to configure and build itself and requires
 
 Required libraries are
 
-* [expat](http://www.libexpat.org/)
-* [proj](http://proj.osgeo.org/)
+* [expat](https://libexpat.github.io/)
+* [proj](https://proj.org/)
 * [bzip2](http://www.bzip.org/)
-* [zlib](http://www.zlib.net/)
-* [Boost libraries](http://www.boost.org/), including system and filesystem
-* [PostgreSQL](http://www.postgresql.org/) client libraries
-* [Lua](http://www.lua.org/) (Optional, used for [Lua tag transforms](docs/lua.md))
+* [zlib](https://www.zlib.net/)
+* [Boost libraries](https://www.boost.org/), including system and filesystem
+* [PostgreSQL](https://www.postgresql.org/) client libraries
+* [Lua](https://www.lua.org/) (Optional, used for [Lua tag transforms](docs/lua.md))
 * [Python](https://python.org/) (only for running tests)
 * [Psycopg](http://initd.org/psycopg/) (only for running tests)
 
 It also requires access to a database server running
-[PostgreSQL](http://www.postgresql.org/) 9.1+ and [PostGIS](http://www.postgis.net/) 2.0+.
+[PostgreSQL](https://www.postgresql.org/) 9.3+ and
+[PostGIS](http://www.postgis.net/) 2.2+.
 
 Make sure you have installed the development packages for the libraries
 mentioned in the requirements section and a C++ compiler which supports C++11.
-Both GCC 4.8 and Clang 3.4 meet this requirement.
+GCC 5 and later and Clang 3.5 and later are known to work.
 
 First install the dependencies.
 
@@ -132,14 +136,14 @@ createdb gis
 psql -d gis -c 'CREATE EXTENSION postgis; CREATE EXTENSION hstore;'
 ```
 
-A basic invocation to load the data into the database ``gis`` for rendering would be
+A basic invocation to load the data into the database `gis` for rendering would be
 
 ```sh
 osm2pgsql --create --database gis data.osm.pbf
 ```
 
-This will load the data from ``data.osm.pbf`` into the ``planet_osm_point``,
-``planet_osm_line``, ``planet_osm_roads``, and ``planet_osm_polygon`` tables.
+This will load the data from `data.osm.pbf` into the `planet_osm_point`,
+`planet_osm_line`, `planet_osm_roads`, and `planet_osm_polygon` tables.
 
 When importing a large amount of data such as the complete planet, a typical
 command line would be
@@ -149,13 +153,13 @@ osm2pgsql -c -d gis --slim -C <cache size> \
   --flat-nodes <flat nodes> planet-latest.osm.pbf
 ```
 where
-* ``<cache size>`` is about 75% of memory in MiB, to a maximum of about 30000. Additional RAM will not be used.
-* ``<flat nodes>`` is a location where a 36GiB+ file can be saved.
+* `<cache size>` is about 75% of memory in MiB, to a maximum of about 30000. Additional RAM will not be used.
+* `<flat nodes>` is a location where a 36GiB+ file can be saved.
 
-Many different data files (e.g., .pbf) can be found at [planet.osm.org](http://planet.osm.org/).
+Many different data files (e.g., .pbf) can be found at [planet.osm.org](https://planet.osm.org/).
 
 The databases from either of these commands can be used immediately by
-[Mapnik](http://mapnik.org/) for rendering maps with standard tools like
+[Mapnik](https://mapnik.org/) for rendering maps with standard tools like
 [renderd/mod_tile](https://github.com/openstreetmap/mod_tile),
 [TileMill](https://tilemill-project.github.io/tilemill/), [Nik4](https://github.com/Zverik/Nik4),
 among others. It can also be used for [spatial analysis](docs/analysis.md) or
@@ -167,14 +171,14 @@ among others. It can also be used for [spatial analysis](docs/analysis.md) or
 
 In addition to the standard [pgsql](docs/pgsql.md) backend designed for
 rendering there is also the [gazetteer](docs/gazetteer.md) database for
-geocoding, principally with [Nominatim](http://www.nominatim.org/), and the
+geocoding, principally with [Nominatim](https://www.nominatim.org/), and the
 null backend for testing. For flexibility a new [multi](docs/multi.md)
 backend is also available which allows the configuration of custom
 PostgreSQL tables instead of those provided in the pgsql backend.
 
 ## LuaJIT support ##
 
-To speed up Lua tag transformations, [LuaJIT](http://luajit.org/) can be optionally
+To speed up Lua tag transformations, [LuaJIT](https://luajit.org/) can be optionally
 enabled on supported platforms. Performance measurements have shown about 25%
 runtime reduction for a planet import, with about 40% reduction on parsing time.
 
@@ -210,4 +214,4 @@ please use the [issue tracker on GitHub](https://github.com/openstreetmap/osm2pg
 More information can be found in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 General queries can be sent to the tile-serving@ or dev@
-[mailing lists](http://wiki.openstreetmap.org/wiki/Mailing_lists).
+[mailing lists](https://wiki.openstreetmap.org/wiki/Mailing_lists).

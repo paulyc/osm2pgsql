@@ -202,10 +202,10 @@ namespace osmium {
                     // byte order followed by the BlobHeader followed by the Blob
                     std::string output;
                     output.reserve(4 + blob_header_data.size() + blob_data.size());
-                    output += static_cast<char>((size >> 24u) & 0xffu);
-                    output += static_cast<char>((size >> 16u) & 0xffu);
-                    output += static_cast<char>((size >>  8u) & 0xffu);
-                    output += static_cast<char>( size         & 0xffu);
+                    output += static_cast<char>((size >> 24U) & 0xffU);
+                    output += static_cast<char>((size >> 16U) & 0xffU);
+                    output += static_cast<char>((size >>  8U) & 0xffU);
+                    output += static_cast<char>( size         & 0xffU);
                     output.append(blob_header_data);
                     output.append(blob_data);
 
@@ -439,7 +439,7 @@ namespace osmium {
                  * needs about 0.1 to 0.3% of the block size).
                  */
                 enum {
-                    max_used_blob_size = max_uncompressed_blob_size * 95u / 100u
+                    max_used_blob_size = max_uncompressed_blob_size * 95U / 100U
                 };
 
                 bool can_add(OSMFormat::PrimitiveGroup type) const noexcept {
@@ -575,6 +575,10 @@ namespace osmium {
 
                     if (m_options.locations_on_ways) {
                         pbf_header_block.add_string(OSMFormat::HeaderBlock::repeated_string_optional_features, "LocationsOnWays");
+                    }
+
+                    if (header.get("sorting") == "Type_then_ID") {
+                        pbf_header_block.add_string(OSMFormat::HeaderBlock::repeated_string_optional_features, "Sort.Type_then_ID");
                     }
 
                     pbf_header_block.add_string(OSMFormat::HeaderBlock::optional_string_writingprogram, header.get("generator"));
