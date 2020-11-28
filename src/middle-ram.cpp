@@ -7,14 +7,11 @@
  * emit the final geometry-enabled output formats
 */
 
-#include <stdexcept>
-
 #include <cassert>
-#include <cstdio>
+#include <memory>
 
 #include <osmium/builder/attr.hpp>
 
-#include "id-tracker.hpp"
 #include "middle-ram.hpp"
 #include "node-ram-cache.hpp"
 #include "options.hpp"
@@ -33,27 +30,28 @@
  *
  */
 
-void middle_ram_t::nodes_set(osmium::Node const &node)
+void middle_ram_t::node_set(osmium::Node const &node)
 {
-    cache->set(node.id(), node.location());
+    m_cache->set(node.id(), node.location());
 }
 
-void middle_ram_t::ways_set(osmium::Way const &way)
+void middle_ram_t::way_set(osmium::Way const &way)
 {
-    ways.set(way.id(), new ramWay(way, extra_attributes));
+    m_ways.set(way.id(), new ramWay{way, m_extra_attributes});
 }
 
-void middle_ram_t::relations_set(osmium::Relation const &rel)
+void middle_ram_t::relation_set(osmium::Relation const &rel)
 {
-    rels.set(rel.id(), new ramRel(rel, extra_attributes));
+    m_rels.set(rel.id(), new ramRel{rel, m_extra_attributes});
 }
 
 size_t middle_ram_t::nodes_get_list(osmium::WayNodeList *nodes) const
 {
+    assert(nodes);
     size_t count = 0;
 
     for (auto &n : *nodes) {
-        auto loc = cache->get(n.ref());
+        auto loc = m_cache->get(n.ref());
         n.set_location(loc);
         if (loc.valid()) {
             ++count;
@@ -63,41 +61,9 @@ size_t middle_ram_t::nodes_get_list(osmium::WayNodeList *nodes) const
     return count;
 }
 
-void middle_ram_t::iterate_relations(pending_processor &pf)
+bool middle_ram_t::way_get(osmid_t id, osmium::memory::Buffer &buffer) const
 {
-    //TODO: just dont do anything
-
-    //let the outputs enqueue everything they have the non slim middle
-    //has nothing of its own to enqueue as it doesnt have pending anything
-    pf.enqueue_relations(id_tracker::max());
-
-    //let the threads process the relations
-    pf.process_relations();
-}
-
-size_t middle_ram_t::pending_count() const { return 0; }
-
-void middle_ram_t::iterate_ways(middle_t::pending_processor &pf)
-{
-    //let the outputs enqueue everything they have the non slim middle
-    //has nothing of its own to enqueue as it doesnt have pending anything
-    pf.enqueue_ways(id_tracker::max());
-
-    //let the threads process the ways
-    pf.process_ways();
-}
-
-void middle_ram_t::release_relations() { rels.clear(); }
-
-void middle_ram_t::release_ways() { ways.clear(); }
-
-bool middle_ram_t::ways_get(osmid_t id, osmium::memory::Buffer &buffer) const
-{
-    if (simulate_ways_deleted) {
-        return false;
-    }
-
-    auto const *ele = ways.get(id);
+    auto const *ele = m_ways.get(id);
 
     if (!ele) {
         return false;
@@ -116,7 +82,7 @@ size_t middle_ram_t::rel_way_members_get(osmium::Relation const &rel,
 {
     size_t count = 0;
     for (auto const &m : rel.members()) {
-        if (m.type() == osmium::item_type::way && ways_get(m.ref(), buffer)) {
+        if (m.type() == osmium::item_type::way && way_get(m.ref(), buffer)) {
             if (roles) {
                 roles->emplace_back(m.role());
             }
@@ -127,10 +93,10 @@ size_t middle_ram_t::rel_way_members_get(osmium::Relation const &rel,
     return count;
 }
 
-bool middle_ram_t::relations_get(osmid_t id,
-                                 osmium::memory::Buffer &buffer) const
+bool middle_ram_t::relation_get(osmid_t id,
+                                osmium::memory::Buffer &buffer) const
 {
-    auto const *ele = rels.get(id);
+    auto const *ele = m_rels.get(id);
 
     if (!ele) {
         return false;
@@ -144,49 +110,19 @@ bool middle_ram_t::relations_get(osmid_t id,
     return true;
 }
 
-void middle_ram_t::analyze()
-{ /* No need */
-}
-
-void middle_ram_t::start() {}
-
-void middle_ram_t::stop(osmium::thread::Pool &)
+void middle_ram_t::stop(thread_pool_t &)
 {
-    cache.reset(nullptr);
-
-    release_ways();
-    release_relations();
+    m_cache.reset();
+    m_ways.clear();
+    m_rels.clear();
 }
-
-void middle_ram_t::commit() {}
 
 middle_ram_t::middle_ram_t(options_t const *options)
-: ways(), rels(),
-  cache(new node_ram_cache(options->alloc_chunkwise, options->cache)),
-  extra_attributes(options->extra_attributes), simulate_ways_deleted(false)
+: m_cache(new node_ram_cache{options->alloc_chunkwise, options->cache}),
+  m_extra_attributes(options->extra_attributes)
 {}
 
-middle_ram_t::~middle_ram_t()
+std::shared_ptr<middle_query_t> middle_ram_t::get_query_instance()
 {
-    //instance.reset();
-}
-
-idlist_t middle_ram_t::relations_using_way(osmid_t) const
-{
-    // this function shouldn't be called - relations_using_way is only used in
-    // slim mode, and a middle_ram_t shouldn't be constructed if the slim mode
-    // option is set.
-    throw std::runtime_error(
-        "middle_ram_t::relations_using_way is unimlpemented, and "
-        "should not have been called. This is probably a bug, please "
-        "report it at https://github.com/openstreetmap/osm2pgsql/issues");
-}
-
-std::shared_ptr<middle_query_t>
-middle_ram_t::get_query_instance(std::shared_ptr<middle_t> const &mid) const
-{
-    auto me = std::dynamic_pointer_cast<middle_ram_t>(mid);
-    assert(me);
-    // No copy here because readonly access is thread safe.
-    return std::static_pointer_cast<middle_query_t>(me);
+    return shared_from_this();
 }

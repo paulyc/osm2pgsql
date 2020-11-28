@@ -1,42 +1,36 @@
 #define _LARGEFILE64_SOURCE /* See feature_test_macros(7) */
 
+#include "logging.hpp"
 #include "node-persistent-cache.hpp"
 #include "options.hpp"
 
-void node_persistent_cache::set(osmid_t id, const osmium::Location &coord)
+void node_persistent_cache::set(osmid_t id, osmium::Location location)
 {
     if (id < 0) {
-        throw std::runtime_error("Flatnode store cannot save negative IDs.");
+        throw std::runtime_error{"Flatnode store cannot save negative IDs."};
     }
-    m_index->set(static_cast<osmium::unsigned_object_id_type>(id), coord);
+    m_index->set(static_cast<osmium::unsigned_object_id_type>(id), location);
 }
 
-osmium::Location node_persistent_cache::get(osmid_t id)
+osmium::Location node_persistent_cache::get(osmid_t id) const noexcept
 {
-    if (id >= 0) {
-        try {
-            return m_index->get(
-                static_cast<osmium::unsigned_object_id_type>(id));
-        } catch (osmium::not_found const &) {
-        }
+    if (id < 0) {
+        return osmium::Location{};
     }
 
-    return osmium::Location();
+    return m_index->get_noexcept(
+        static_cast<osmium::unsigned_object_id_type>(id));
 }
 
-size_t node_persistent_cache::get_list(osmium::WayNodeList *nodes)
+std::size_t node_persistent_cache::get_list(osmium::WayNodeList *nodes) const
 {
-    size_t count = 0;
+    std::size_t count = 0;
 
     for (auto &n : *nodes) {
         auto loc = m_ram_cache->get(n.ref());
-        /* Check cache first */
         if (!loc.valid() && n.ref() >= 0) {
-            try {
-                loc = m_index->get(
-                    static_cast<osmium::unsigned_object_id_type>(n.ref()));
-            } catch (osmium::not_found const &) {
-            }
+            loc = m_index->get_noexcept(
+                static_cast<osmium::unsigned_object_id_type>(n.ref()));
         }
         n.set_location(loc);
         if (loc.valid()) {
@@ -49,28 +43,29 @@ size_t node_persistent_cache::get_list(osmium::WayNodeList *nodes)
 
 node_persistent_cache::node_persistent_cache(
     const options_t *options, std::shared_ptr<node_ram_cache> ptr)
-: m_ram_cache(ptr)
+: m_ram_cache(std::move(ptr))
 {
     if (!options->flat_node_file) {
-        throw std::runtime_error("Unable to set up persistent cache: the name "
-                                 "of the flat node file was not set.");
+        throw std::runtime_error{"Unable to set up persistent cache: the name "
+                                 "of the flat node file was not set."};
     }
 
     m_fname = options->flat_node_file->c_str();
     m_remove_file = options->droptemp;
-    fprintf(stderr, "Mid: loading persistent node cache from %s\n", m_fname);
+    log_info("Mid: loading persistent node cache from {}", m_fname);
 
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg, hicpp-signed-bitwise)
     m_fd = open(m_fname, O_RDWR | O_CREAT, 0644);
     if (m_fd < 0) {
-        fprintf(stderr, "Cannot open location cache file '%s': %s\n", m_fname,
-                std::strerror(errno));
-        throw std::runtime_error("Unable to open flatnode file\n");
+        log_error("Cannot open location cache file '{}': {}", m_fname,
+                  std::strerror(errno));
+        throw std::runtime_error{"Unable to open flatnode file."};
     }
 
     m_index.reset(new index_t{m_fd});
 }
 
-node_persistent_cache::~node_persistent_cache()
+node_persistent_cache::~node_persistent_cache() noexcept
 {
     m_index.reset();
     if (m_fd >= 0) {
@@ -78,7 +73,10 @@ node_persistent_cache::~node_persistent_cache()
     }
 
     if (m_remove_file) {
-        fprintf(stderr, "Mid: removing persistent node cache at %s\n", m_fname);
+        try {
+            log_info("Mid: removing persistent node cache at {}", m_fname);
+        } catch (...) {
+        }
         unlink(m_fname);
     }
 }

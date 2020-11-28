@@ -55,14 +55,14 @@ class writer_t
         str_push(str, type | wkb_srid);
         str_push(str, m_srid);
 
-        const size_t offset = str.size();
+        std::size_t const offset = str.size();
         if (add_length) {
             str_push(str, static_cast<uint32_t>(0));
         }
         return offset;
     }
 
-    void set_size(const size_t offset, const size_t size)
+    void set_size(size_t const offset, size_t const size)
     {
         uint32_t s = static_cast<uint32_t>(size);
         std::copy_n(reinterpret_cast<char *>(&s), sizeof(uint32_t),
@@ -72,7 +72,7 @@ class writer_t
     template <typename T>
     inline static void str_push(std::string &str, T data)
     {
-        str.append(reinterpret_cast<const char *>(&data), sizeof(T));
+        str.append(reinterpret_cast<char const *>(&data), sizeof(T));
     }
 
 public:
@@ -80,7 +80,7 @@ public:
 
     void add_sub_geometry(std::string const &part) { m_data.append(part); }
 
-    void add_location(const osmium::geom::Coordinates &xy)
+    void add_location(osmium::geom::Coordinates const &xy)
     {
         str_push(m_data, xy.x);
         str_push(m_data, xy.y);
@@ -88,7 +88,7 @@ public:
 
     /* Point */
 
-    std::string make_point(const osmium::geom::Coordinates &xy) const
+    std::string make_point(osmium::geom::Coordinates const &xy) const
     {
         std::string data;
         header(data, wkb_point, false);
@@ -212,7 +212,8 @@ public:
         }
 
         if (out[0] != Endian) {
-            throw std::runtime_error(
+            throw std::runtime_error
+            {
 #if __BYTE_ORDER == __LITTLE_ENDIAN
                 "Geometries in the database are returned in big-endian byte "
                 "order. "
@@ -220,7 +221,8 @@ public:
                 "Geometries in the database are returned in little-endian byte "
                 "order. "
 #endif
-                "osm2pgsql can only process geometries in native byte order.");
+                "osm2pgsql can only process geometries in native byte order."
+            };
         }
         return out;
     }
@@ -235,23 +237,23 @@ public:
     {
         m_pos += sizeof(uint8_t); // skip endianess
 
-        auto type = read_data<uint32_t>();
+        auto const type = read_data<uint32_t>();
 
         if (type & wkb_srid) {
             m_pos += sizeof(int); // skip srid
         }
 
-        return type & 0xff;
+        return type & 0xffU;
     }
 
     uint32_t read_length() { return read_data<uint32_t>(); }
 
     osmium::geom::Coordinates read_point()
     {
-        auto x = read_data<double>();
-        auto y = read_data<double>();
+        auto const x = read_data<double>();
+        auto const y = read_data<double>();
 
-        return osmium::geom::Coordinates(x, y);
+        return osmium::geom::Coordinates{x, y};
     }
 
     void skip_points(size_t num) { m_pos += sizeof(double) * 2 * num; }
@@ -261,12 +263,12 @@ public:
     {
         double total = 0;
 
-        auto type = read_header();
+        auto const type = read_header();
 
         if (type == wkb_polygon) {
             total = get_polygon_area(proj);
         } else if (type == wkb_multi_polygon) {
-            auto num_poly = read_length();
+            auto const num_poly = read_length();
             for (unsigned i = 0; i < num_poly; ++i) {
                 auto ptype = read_header();
                 (void)ptype;
@@ -283,7 +285,7 @@ private:
     template <typename PROJ>
     double get_polygon_area(PROJ *proj)
     {
-        auto num_rings = read_length();
+        auto const num_rings = read_length();
         assert(num_rings > 0);
 
         double total = get_ring_area(proj);
@@ -301,16 +303,14 @@ private:
         // Algorithm borrowed from
         // http://stackoverflow.com/questions/451426/how-do-i-calculate-the-area-of-a-2d-polygon
         // XXX numerically not stable (useless for latlon)
-        auto num_pts = read_length();
+        auto const num_pts = read_length();
         assert(num_pts > 3);
 
         double total = 0;
 
-        auto prev = read_point();
-        proj->target_to_tile(&prev.y, &prev.x);
+        auto prev = proj->target_to_tile(read_point());
         for (unsigned i = 1; i < num_pts; ++i) {
-            auto cur = read_point();
-            proj->target_to_tile(&cur.y, &cur.x);
+            auto const cur = proj->target_to_tile(read_point());
             total += prev.x * cur.y - cur.x * prev.y;
             prev = cur;
         }
@@ -322,14 +322,14 @@ private:
     {
         // Algorithm borrowed from
         // http://stackoverflow.com/questions/451426/how-do-i-calculate-the-area-of-a-2d-polygon
-        auto num_pts = read_length();
+        auto const num_pts = read_length();
         assert(num_pts > 3);
 
         double total = 0;
 
         auto prev = read_point();
         for (unsigned i = 1; i < num_pts; ++i) {
-            auto cur = read_point();
+            auto const cur = read_point();
             total += prev.x * cur.y - cur.x * prev.y;
             prev = cur;
         }

@@ -4,19 +4,9 @@ extern "C"
 #include <lualib.h>
 }
 
-#include <boost/filesystem.hpp>
-
 #include "format.hpp"
 #include "options.hpp"
 #include "tagtransform-lua.hpp"
-
-static std::string adapt_relative_filename(std::string const &lua_file,
-                                           std::string const &style_file)
-{
-    boost::filesystem::path base_path{style_file};
-    return boost::filesystem::absolute(lua_file, base_path.parent_path())
-        .string();
-}
 
 lua_tagtransform_t::lua_tagtransform_t(options_t const *options)
 : m_node_func(
@@ -26,8 +16,7 @@ lua_tagtransform_t::lua_tagtransform_t(options_t const *options)
       options->tag_transform_rel_func.get_value_or("filter_basic_tags_rel")),
   m_rel_mem_func(options->tag_transform_rel_mem_func.get_value_or(
       "filter_tags_relation_member")),
-  m_lua_file(adapt_relative_filename(options->tag_transform_script.get(),
-                                     options->style)),
+  m_lua_file(options->tag_transform_script.get()),
   m_extra_attributes(options->extra_attributes)
 {
     open_style();
@@ -39,7 +28,7 @@ void lua_tagtransform_t::open_style()
     luaL_openlibs(L);
     if (luaL_dofile(L, m_lua_file.c_str())) {
         throw std::runtime_error{
-            "Lua tag transform style error: {}"_format(lua_tostring(L, -1))};
+            "Lua tag transform style error: {}."_format(lua_tostring(L, -1))};
     }
 
     check_lua_function_exists(m_node_func);
@@ -58,12 +47,12 @@ std::unique_ptr<tagtransform_t> lua_tagtransform_t::clone() const
     return std::unique_ptr<tagtransform_t>(c.release());
 }
 
-void lua_tagtransform_t::check_lua_function_exists(const std::string &func_name)
+void lua_tagtransform_t::check_lua_function_exists(std::string const &func_name)
 {
     lua_getglobal(L, func_name.c_str());
     if (!lua_isfunction(L, -1)) {
         throw std::runtime_error{
-            "Tag transform style does not contain a function {}"_format(
+            "Tag transform style does not contain a function {}."_format(
                 func_name)};
     }
     lua_pop(L, 1);
@@ -83,7 +72,7 @@ bool lua_tagtransform_t::filter_tags(osmium::OSMObject const &o, int *polygon,
         lua_getglobal(L, m_rel_func.c_str());
         break;
     default:
-        throw std::runtime_error("Unknown OSM type");
+        throw std::runtime_error{"Unknown OSM type."};
     }
 
     lua_newtable(L); /* key value table */
@@ -111,7 +100,7 @@ bool lua_tagtransform_t::filter_tags(osmium::OSMObject const &o, int *polygon,
     if (lua_pcall(L, 2, (o.type() == osmium::item_type::way) ? 4 : 2, 0)) {
         /* lua function failed */
         throw std::runtime_error{"Failed to execute lua function for basic tag "
-                                 "processing: {}"_format(lua_tostring(L, -1))};
+                                 "processing: {}."_format(lua_tostring(L, -1))};
     }
 
     if (o.type() == osmium::item_type::way) {
@@ -127,17 +116,17 @@ bool lua_tagtransform_t::filter_tags(osmium::OSMObject const &o, int *polygon,
 
     lua_pushnil(L);
     while (lua_next(L, -2) != 0) {
-        const char *key = lua_tostring(L, -2);
-        const char *value = lua_tostring(L, -1);
+        char const *const key = lua_tostring(L, -2);
+        char const *const value = lua_tostring(L, -1);
         if (key == nullptr) {
-            int ltype = lua_type(L, -2);
+            int const ltype = lua_type(L, -2);
             throw std::runtime_error{
                 "Basic tag processing returned NULL key. Possibly this is "
                 "due an incorrect data type '{}'."_format(
                     lua_typename(L, ltype))};
         }
         if (value == nullptr) {
-            int ltype = lua_type(L, -1);
+            int const ltype = lua_type(L, -1);
             throw std::runtime_error{
                 "Basic tag processing returned NULL value. Possibly this "
                 "is due an incorrect data type '{}'."_format(
@@ -147,7 +136,7 @@ bool lua_tagtransform_t::filter_tags(osmium::OSMObject const &o, int *polygon,
         lua_pop(L, 1);
     }
 
-    bool filter = lua_tointeger(L, -2);
+    bool const filter = lua_tointeger(L, -2);
 
     lua_pop(L, 2);
 
@@ -159,12 +148,12 @@ bool lua_tagtransform_t::filter_rel_member_tags(
     rolelist_t const &member_roles, int *make_boundary, int *make_polygon,
     int *roads, taglist_t &out_tags, bool)
 {
-    size_t num_members = member_roles.size();
+    size_t const num_members = member_roles.size();
     lua_getglobal(L, m_rel_mem_func.c_str());
 
     lua_newtable(L); /* relations key value table */
 
-    for (const auto &rel_tag : rel_tags) {
+    for (auto const &rel_tag : rel_tags) {
         lua_pushstring(L, rel_tag.key.c_str());
         lua_pushstring(L, rel_tag.value.c_str());
         lua_rawset(L, -3);
@@ -198,7 +187,7 @@ bool lua_tagtransform_t::filter_rel_member_tags(
         /* lua function failed */
         throw std::runtime_error{
             "Failed to execute lua function for relation tag "
-            "processing: {}"_format(lua_tostring(L, -1))};
+            "processing: {}."_format(lua_tostring(L, -1))};
     }
 
     *roads = (int)lua_tointeger(L, -1);
@@ -213,14 +202,14 @@ bool lua_tagtransform_t::filter_rel_member_tags(
 
     lua_pushnil(L);
     while (lua_next(L, -2) != 0) {
-        char const *key = lua_tostring(L, -2);
-        char const *value = lua_tostring(L, -1);
+        char const *const key = lua_tostring(L, -2);
+        char const *const value = lua_tostring(L, -1);
         out_tags.add_tag(key, value);
         lua_pop(L, 1);
     }
     lua_pop(L, 1);
 
-    bool filter = lua_tointeger(L, -1);
+    bool const filter = lua_tointeger(L, -1);
 
     lua_pop(L, 1);
 

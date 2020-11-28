@@ -16,9 +16,9 @@
     to call osm2pgsql and then inherits from all test groups it wants executed.
 """
 
-from collections import namedtuple
 import logging
 from os import path as op
+import os
 import subprocess
 import sys
 import psycopg2
@@ -98,17 +98,26 @@ class BaseRunner(object):
     use_lua_tagtransform = False
     import_file = None
     update_file = None
+    schema = None
 
     @classmethod
     def setUpClass(cls):
+        try:
+            # In case one is left over from a previous test
+            os.remove('flat.nodes')
+        except (FileNotFoundError):
+            pass
         if cls.use_lua_tagtransform and not CONFIG['have_lua']:
             cls.skipTest(None, "No Lua configured.")
         if 'tablespacetest' in cls.extra_params and not CONFIG['have_lua']:
             cls.skipTest(None, "Test tablespace 'tablespacetest' not configured.")
         with psycopg2.connect("dbname='{}'".format(CONFIG['test_database'])) as conn:
             with conn.cursor() as cur:
-                for t in ('nodes', 'ways', 'rels'):
+                for t in ('nodes', 'ways', 'rels', 'point', 'line', 'roads', 'polygon'):
                     cur.execute("DROP TABLE IF EXISTS planet_osm_" + t)
+                cur.execute("DROP SCHEMA IF EXISTS osm CASCADE")
+                if cls.schema:
+                    cur.execute("CREATE SCHEMA " + cls.schema)
 
         if cls.import_file:
             cls.run_import(cls.get_def_params() + cls.extra_params,
@@ -124,6 +133,13 @@ class BaseRunner(object):
         if BaseRunner.conn:
             BaseRunner.conn.close()
             BaseRunner.conn = None
+        if cls.schema:
+            with psycopg2.connect("dbname='{}'".format(CONFIG['test_database'])) as conn:
+                conn.cursor().execute("DROP SCHEMA IF EXISTS {} CASCADE".format(cls.schema))
+        try:
+            os.remove('flat.nodes')
+        except (FileNotFoundError):
+            pass
 
     @classmethod
     def get_def_params(cls):
@@ -143,7 +159,8 @@ class BaseRunner(object):
     @classmethod
     def run_import(cls, params, filename):
         cmdline = [CONFIG['executable']]
-        cmdline.extend(('-d', CONFIG['test_database']))
+        if not '-d' in params and not '--database' in params:
+            cmdline.extend(('-d', CONFIG['test_database']))
         cmdline.extend(params)
         cmdline.append(op.join(CONFIG['test_data_path'], filename))
         logging.info("Executing command: {}".format(' '.join(cmdline)))
@@ -161,6 +178,8 @@ class BaseRunner(object):
 
 
     def assert_count(self, count, table, where=None):
+        if self.schema:
+            table = self.schema + '.' + table
         sql = 'SELECT count(*) FROM ' + table
         if where:
             sql += ' WHERE ' + where
@@ -193,6 +212,15 @@ class MultipolygonUpdateRunner(BaseRunner):
     import_file = 'test_multipolygon.osm'
     update_file = 'test_multipolygon_diff.osc'
     update = True
+
+
+class BaseUpdateRunnerWithOutputSchema(BaseUpdateRunner):
+    schema = 'osm'
+
+
+class DependencyUpdateRunner(BaseRunner):
+    import_file = 'test_forward_dependencies.opl'
+    update_file = 'test_forward_dependencies_diff.opl'
 
 
 ########################################################################
@@ -492,6 +520,9 @@ class MultipolygonTests(object):
     def test_different_tags_on_relation_and_way_way_presence(self):
         self.assert_count(1, 'planet_osm_polygon', where='osm_id = 140')
 
+    def test_planet_osm_nodes(self):
+        self.assert_count(1, 'pg_tables',
+                          where="tablename = 'planet_osm_nodes'")
 
 
 ########################################################################
@@ -601,7 +632,7 @@ class TestPgsqlUpdate(BaseUpdateRunner, unittest.TestCase,
 
 class TestPgsqlUpdateParallel(BaseUpdateRunner, unittest.TestCase,
                               PgsqlBaseTests):
-    extra_params = ['--slim', '--number-processes', '16']
+    extra_params = ['--slim', '--number-processes', '15']
 
 class TestPgsqlUpdateSmallCache(BaseUpdateRunner, unittest.TestCase,
                                 PgsqlBaseTests):
@@ -734,4 +765,66 @@ class TestMPUpdateSlimLuaHstore(MultipolygonUpdateRunner, unittest.TestCase,
                                 MultipolygonTests):
     extra_params = ['--slim', '-k']
     use_lua_tagtransform = True
+
+class TestMPUpdateSlimWithFlatNodes(MultipolygonUpdateRunner, unittest.TestCase,
+                                    MultipolygonTests):
+    extra_params = ['--slim', '-F', 'flat.nodes']
+
+    def test_planet_osm_nodes(self):
+        self.assert_count(0, 'pg_tables',
+                          where="tablename = 'planet_osm_nodes'")
+
+class TestMPUpdateWithForwardDependencies(DependencyUpdateRunner, unittest.TestCase):
+    extra_params = ['--latlong', '--slim', '--with-forward-dependencies=true']
+
+    def test_count(self):
+        self.assert_count(1, 'planet_osm_point')
+        self.assert_count(1, 'planet_osm_line')
+        self.assert_count(0, 'planet_osm_line', 'abs(ST_X(ST_StartPoint(way)) - 3.0) < 0.0001')
+        self.assert_count(1, 'planet_osm_line', 'abs(ST_X(ST_StartPoint(way)) - 3.1) < 0.0001')
+        self.assert_count(1, 'planet_osm_roads')
+        self.assert_count(1, 'planet_osm_polygon')
+
+class TestMPUpdateWithoutForwardDependencies(DependencyUpdateRunner, unittest.TestCase):
+    extra_params = ['--latlong', '--slim', '--with-forward-dependencies=false']
+
+    def test_count(self):
+        self.assert_count(1, 'planet_osm_point')
+        self.assert_count(1, 'planet_osm_line')
+        self.assert_count(1, 'planet_osm_line', 'abs(ST_X(ST_StartPoint(way)) - 3.0) < 0.0001')
+        self.assert_count(0, 'planet_osm_line', 'abs(ST_X(ST_StartPoint(way)) - 3.1) < 0.0001')
+        self.assert_count(1, 'planet_osm_roads')
+        self.assert_count(2, 'planet_osm_polygon')
+
+# Database access tests
+
+class TestDBAccessNorm(BaseUpdateRunner, unittest.TestCase,
+                       PgsqlBaseTests):
+    extra_params = ['--slim', '-d', CONFIG['test_database']]
+
+class TestDBAccessNormLong(BaseUpdateRunner, unittest.TestCase,
+                       PgsqlBaseTests):
+    extra_params = ['--slim', '--database', CONFIG['test_database']]
+
+class TestDBAccessConninfo(BaseUpdateRunner, unittest.TestCase,
+                           PgsqlBaseTests):
+    extra_params = ['--slim', '-d', 'dbname=' + CONFIG['test_database']]
+
+class TestDBAccessConninfoLong(BaseUpdateRunner, unittest.TestCase,
+                               PgsqlBaseTests):
+    extra_params = ['--slim', '--database', 'dbname=' + CONFIG['test_database']]
+
+class TestDBAccessURIPostgresql(BaseUpdateRunner, unittest.TestCase,
+                                PgsqlBaseTests):
+    extra_params = ['--slim', '-d', 'postgresql:///' + CONFIG['test_database']]
+
+class TestDBAccessURIPostgres(BaseUpdateRunner, unittest.TestCase,
+                              PgsqlBaseTests):
+    extra_params = ['--slim', '-d', 'postgres:///' + CONFIG['test_database']]
+
+# Schema tests
+
+class TestDBOutputSchema(BaseUpdateRunnerWithOutputSchema, unittest.TestCase,
+                         PgsqlBaseTests):
+    extra_params = ['--slim', '--output-pgsql-schema=osm']
 

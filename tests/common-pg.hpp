@@ -80,7 +80,7 @@ public:
     tempdb_t() noexcept
     {
         try {
-            conn_t conn("dbname=postgres");
+            conn_t conn{"dbname=postgres"};
 
             m_db_name = "osm2pgsql-test-{}-{}"_format(getpid(), time(nullptr));
             conn.exec("DROP DATABASE IF EXISTS \"{}\""_format(m_db_name));
@@ -91,9 +91,11 @@ public:
             local.exec("CREATE EXTENSION postgis");
             local.exec("CREATE EXTENSION hstore");
         } catch (std::runtime_error const &e) {
-            fprintf(stderr, "Test database cannot be created: %s\n", e.what());
-            fprintf(stderr, "Did you mean to run 'pg_virtualenv ctest'?\n");
-            exit(1);
+            fmt::print(stderr,
+                       "Test database cannot be created: {}\n"
+                       "Did you mean to run 'pg_virtualenv ctest'?\n",
+                       e.what());
+            std::exit(1);
         }
     }
 
@@ -109,7 +111,7 @@ public:
             // Disable removal of the test database by setting the environment
             // variable OSM2PGSQL_KEEP_TEST_DB to anything. This can be useful
             // when debugging tests.
-            const char *const keep_db = std::getenv("OSM2PGSQL_KEEP_TEST_DB");
+            char const *const keep_db = std::getenv("OSM2PGSQL_KEEP_TEST_DB");
             if (keep_db != nullptr) {
                 return;
             }

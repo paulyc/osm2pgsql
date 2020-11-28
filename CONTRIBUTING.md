@@ -23,11 +23,10 @@ in modern C++, making use of data structures in the standard library.
 
 ## Versioning
 
-Osm2pgsql uses a X.Y.Z version number, where Y tells you if you are on a stable
-or development series. Even numbers are stable and development versions are odd.
+Osm2pgsql uses [semantic versioning](https://semver.org/).
 
 Bugs and known issues are fixed on the main branch only. Exceptions may be made
-for easy bug fixes, or if a patch backporting a fix is provided.
+for severe bugs.
 
 ## Code style
 
@@ -42,7 +41,7 @@ Template parameters must use all upper case.
 Headers should be included in the order `config.h`, C++ standard library headers,
 C library headers, Boost headers, and last osm2pgsql files.
 
-There is a .clang-format configuration avialable and all code must be run through
+There is a .clang-format configuration available and all code must be run through
 clang-format before submitting. You can use git-clang-format after staging all
 your changes:
 
@@ -50,14 +49,18 @@ your changes:
 
 clang-format 7 or later is required.
 
+Comments in code should follow the [Doxygen
+convention](https://www.doxygen.nl/manual/docblocks.html) using backslashes
+(not @-signs) for commands.
+
 ## Documentation
 
-User documentation is stored in `docs/`. Pages on the OpenStreetMap wiki are
-known to be unreliable and outdated.
+User documentation is available on [the website](https://osm2pgsql.org/), some
+is stored in `docs/`. Pages on the OpenStreetMap wiki are known to be
+unreliable and outdated.
 
-There is some documentation in Doxygen-formatted comments. The documentation can
-be generated with `doxygen docs/Doxyfile`. It is not yet hooked into the build
-scripts as most functions are not yet documented.
+The [man page](docs/osm2pgsql.1) can be built from [source](docs/osm2pgsql.md)
+with `make man`. The result should be checked into the repository.
 
 ## Platforms targeted
 
@@ -118,8 +121,25 @@ database created by `pg_virtualenv`.
 If performance testing with a full planet import is required, indicate what
 needs testing in a pull request.
 
+## Coverage reports
+
+To create coverage reports, set `BUILD_COVERAGE` in the CMake config to `ON`,
+compile and run the tests. Then run `make coverage`. This will generate a
+coverage report in `coverage/index.html` in the build directory.
+
+For this to work you need a coverage tool installed. For GCC this is `gcov`,
+for Clang this is `llvm-cov` in the right version. CMake will automatically
+try to find the correct tool. In any case the tool `gcovr` is used to create
+the report.
+
+## Releasing a new version
+
+* Decide on a new version. (See [semantic versioning](https://semver.org/).)
+* Update version in [CMakeLists.txt](CMakeLists.txt), look for `PACKAGE_VERSION`
+* Build man page (`make man`) and copy it to `docs/osm2pgsql.1`.
+* ...
+
 ## Maintainers
 
 The current maintainers of osm2pgsql are [Sarah Hoffmann](https://github.com/lonvia/)
-and [Paul Norman](https://github.com/pnorman/). Sarah has more experience with
-the gazetteer backend and Paul with the pgsql and multi backends.
+and [Paul Norman](https://github.com/pnorman/).

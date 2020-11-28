@@ -1,6 +1,6 @@
 set(PACKAGE osm2pgsql)
 set(PACKAGE_NAME osm2pgsql)
-set(PACKAGE_VERSION 1.2.0)
+set(PACKAGE_VERSION 1.3.0)
 
 cmake_minimum_required(VERSION 2.8.7)
 
@@ -16,17 +16,10 @@ else()
     set(DEFAULT_STYLE "${CMAKE_INSTALL_PREFIX}/share/osm2pgsql/default.style" CACHE STRING "Default style used unless one is given on the command line")
 endif()
 
-option(BUILD_TESTS "Build test suite" OFF)
-option(WITH_LUA    "Build with Lua support" ON)
-option(WITH_LUAJIT "Build with LuaJIT support" OFF)
-
-if (NOT WIN32 AND NOT APPLE)
-    # No need for this path, just a workaround to make cmake check pass on all systems
-    set(PostgreSQL_TYPE_INCLUDE_DIR /usr/include)
-endif()
-
-# Just in case user installed RPMs from http://yum.postgresql.org/
-list(APPEND CMAKE_PREFIX_PATH /usr/pgsql-9.3 /usr/pgsql-9.4 /usr/pgsql-9.5 /usr/pgsql-9.6)
+option(BUILD_TESTS    "Build test suite" OFF)
+option(BUILD_COVERAGE "Build with coverage" OFF)
+option(WITH_LUA       "Build with Lua support" ON)
+option(WITH_LUAJIT    "Build with LuaJIT support" OFF)
 
 if (PROJECT_SOURCE_DIR STREQUAL PROJECT_BINARY_DIR)
     message(FATAL_ERROR "In-source builds are not allowed, please use a separate build directory like `mkdir build && cd build && cmake ..`")
@@ -59,6 +52,101 @@ option(EXTERNAL_LIBOSMIUM "Do not use the bundled libosmium" OFF)
 option(EXTERNAL_PROTOZERO "Do not use the bundled protozero" OFF)
 option(EXTERNAL_FMT       "Do not use the bundled fmt"       OFF)
 
+set(USE_PROJ_LIB "auto" CACHE STRING "Which version of PROJ API to use: ('4', '6', 'off', or 'auto')")
+
+if (NOT WIN32 AND NOT APPLE)
+    # No need for this path, just a workaround to make cmake work on all systems.
+    # Without this we need the PostgreSQL server libraries installed.
+    # https://stackoverflow.com/questions/13920383/findpostgresql-cmake-wont-work-on-ubuntu
+    set(PostgreSQL_TYPE_INCLUDE_DIR /usr/include)
+endif()
+
+set(MINIMUM_POSTGRESQL_SERVER_VERSION "9.3")
+set(MINIMUM_POSTGRESQL_SERVER_VERSION_NUM "90300")
+
+set(PostgreSQL_ADDITIONAL_VERSIONS "13" "12" "11" "10" "9.6" "9.5" "9.4" "9.3")
+
+#############################################################
+# Version
+#############################################################
+
+find_package(Git)
+
+if (GIT_FOUND)
+    execute_process(COMMAND "${GIT_EXECUTABLE}" describe --tags --dirty=-changed
+                    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+                    OUTPUT_VARIABLE VERSION_FROM_GIT
+                    ERROR_QUIET OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if (VERSION_FROM_GIT)
+        set(VERSION_FROM_GIT " (${VERSION_FROM_GIT})")
+    endif()
+endif()
+
+configure_file(
+    ${PROJECT_SOURCE_DIR}/src/version.cpp.in
+    ${PROJECT_BINARY_DIR}/src/version.cpp
+)
+
+#############################################################
+# Coverage
+#############################################################
+
+if (BUILD_COVERAGE)
+    if (NOT BUILD_TESTS)
+        message(WARNING "Coverage build enabled, but tests not enabled!")
+    endif()
+
+    if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+        string(REGEX REPLACE "^([0-9]+).*$" "llvm-cov-\\1"
+               gcov_ ${CMAKE_CXX_COMPILER_VERSION})
+        set(gcov_param_ " gcov")
+    else()
+        set(gcov_ "gcov")
+        set(gcov_param_ "")
+    endif()
+
+    message(STATUS "Looking for coverage tool: ${gcov_}")
+
+    find_program(GCOV ${gcov_} DOC "Coverage tool")
+
+    if (GCOV STREQUAL "GCOV-NOTFOUND")
+        message(STATUS "  coverage tool not found - coverage disabled")
+    else()
+        message(STATUS "  found")
+
+        message(STATUS "Looking von gcovr")
+        find_program(GCOVR "gcovr" DOC "Coverage report tool")
+        if (GCOVR STREQUAL "GCOVR-NOTFOUND")
+            message(WARNING "  gcovr not found - coverage will not work")
+        else()
+            message(STATUS "  found")
+        endif()
+
+        add_definitions(-g -O0 -fno-inline-functions -fno-inline --coverage)
+
+        set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} --coverage"
+            CACHE
+            STRING "Flags used by the linker during all build types."
+            FORCE)
+
+        set(coverage_report_dir "${CMAKE_BINARY_DIR}/coverage")
+        file(MAKE_DIRECTORY ${coverage_report_dir})
+        add_custom_target(coverage
+            ${GCOVR}
+            ${CMAKE_BINARY_DIR}
+            --root=${CMAKE_SOURCE_DIR}
+            --html-details
+            --html-title "osm2pgsql coverage report"
+            #--verbose
+            #--keep
+            --delete
+            '--exclude=.*contrib.*'
+            --sort-percentage
+            --gcov-executable=${GCOV}${gcov_param_}
+            --output=${coverage_report_dir}/index.html)
+    endif()
+endif()
+
 #############################################################
 # Detect available headers and set global compiler options
 #############################################################
@@ -75,7 +163,7 @@ CHECK_INCLUDE_FILES(unistd.h HAVE_UNISTD_H)
 #############################################################
 
 if (NOT EXTERNAL_LIBOSMIUM)
-    set(OSMIUM_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/contrib/libosmium")
+    set(OSMIUM_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/contrib/libosmium/include")
 endif()
 
 if (NOT EXTERNAL_PROTOZERO)
@@ -88,7 +176,7 @@ endif()
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_BINARY_DIR})
 
-find_package(Osmium 2.14 REQUIRED COMPONENTS io proj)
+find_package(Osmium 2.15.6 REQUIRED COMPONENTS io)
 include_directories(SYSTEM ${OSMIUM_INCLUDE_DIRS} ${PROTOZERO_INCLUDE_DIR} ${FMT_INCLUDE_DIR})
 
 if (WITH_LUA)
@@ -101,6 +189,7 @@ if (WITH_LUA)
         include_directories(SYSTEM ${LUA_INCLUDE_DIR})
     endif()
     set(HAVE_LUA 1)
+    find_program(LUA_EXE lua)
 endif()
 
 find_package(Boost 1.50 REQUIRED COMPONENTS system filesystem)
@@ -115,9 +204,45 @@ find_package(Threads)
 
 set(LIBS ${Boost_LIBRARIES} ${PostgreSQL_LIBRARY} ${OSMIUM_LIBRARIES})
 
+if (USE_PROJ_LIB STREQUAL "off")
+    message(STATUS "Proj library disabled (because USE_PROJ_LIB is set to 'off').")
+else()
+    find_path(PROJ4_INCLUDE_DIR proj_api.h)
+    if (PROJ4_INCLUDE_DIR AND NOT USE_PROJ_LIB STREQUAL "6")
+        message(STATUS "Found proj_api.h")
+        find_library(PROJ_LIBRARY NAMES proj)
+        message(STATUS "Found Proj [API 4] ${PROJ_LIBRARY}")
+        set(HAVE_GENERIC_PROJ 1)
+        set(HAVE_PROJ4 1)
+        list(APPEND LIBS ${PROJ_LIBRARY})
+        include_directories(SYSTEM ${PROJ4_INCLUDE_DIR})
+    elseif (NOT USE_PROJ_LIB STREQUAL "4")
+        find_path(PROJ6_INCLUDE_DIR proj.h)
+        find_library(PROJ_LIBRARY NAMES proj)
+        if (PROJ_LIBRARY)
+            message(STATUS "Found Proj [API 6] ${PROJ_LIBRARY}")
+            set(HAVE_GENERIC_PROJ 1)
+            set(HAVE_PROJ6 1)
+            list(APPEND LIBS ${PROJ_LIBRARY})
+            include_directories(SYSTEM ${PROJ6_INCLUDE_DIR})
+        else()
+            message(STATUS "Proj library not found.")
+            message(STATUS "    Only Mercartor and WGS84 projections will be available.")
+        endif()
+    endif()
+endif()
+
+if (USE_PROJ_LIB STREQUAL "4" AND NOT HAVE_PROJ4)
+    message(FATAL_ERROR "USE_PROJ_LIB was set to '4', but PROJ version 4 API not found")
+endif()
+
+if (USE_PROJ_LIB STREQUAL "6" AND NOT HAVE_PROJ6)
+    message(FATAL_ERROR "USE_PROJ_LIB was set to '6', but PROJ version 4 API not found")
+endif()
+
 if (LUAJIT_FOUND)
     list(APPEND LIBS ${LUAJIT_LIBRARIES})
-elseif(LUA_FOUND)
+elseif (LUA_FOUND)
     list(APPEND LIBS ${LUA_LIBRARIES})
 endif()
 
@@ -130,7 +255,7 @@ if (WIN32)
             include_directories(SYSTEM ${GETOPT_INCLUDE_DIR})
             list(APPEND LIBS ${GETOPT_LIBRARY})
         else()
-            message(ERROR "Can not find getopt library for Windows. Please get it from https://github.com/alex85k/wingetopt or alternative source.")
+            message(FATAL_ERROR "Can not find getopt library for Windows. Please get it from https://github.com/alex85k/wingetopt or alternative source.")
         endif()
     endif()
 endif()
@@ -160,7 +285,7 @@ message(STATUS "Looking for clang-tidy")
 find_program(CLANG_TIDY
              NAMES clang-tidy clang-tidy-10 clang-tidy-9 clang-tidy-8 clang-tidy-7)
 
-if(CLANG_TIDY)
+if (CLANG_TIDY)
     message(STATUS "Looking for clang-tidy - found ${CLANG_TIDY}")
 
     file(GLOB CT_CHECK_FILES src/*.cpp tests/*cpp)
@@ -190,9 +315,14 @@ else()
 endif()
 
 #############################################################
+# Man page
+#############################################################
+
+add_subdirectory(docs)
+
+#############################################################
 # Install
 #############################################################
 
 install(TARGETS osm2pgsql DESTINATION bin)
-install(FILES docs/osm2pgsql.1 DESTINATION share/man/man1)
 install(FILES default.style empty.style DESTINATION share/osm2pgsql)

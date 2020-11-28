@@ -5,53 +5,113 @@
 #include <osmium/io/any_input.hpp>
 #include <osmium/io/file.hpp>
 #include <osmium/io/reader.hpp>
+#include <osmium/osm/types_from_string.hpp>
 #include <osmium/visitor.hpp>
 
+#include "dependency-manager.hpp"
 #include "geometry-processor.hpp"
 #include "middle-pgsql.hpp"
 #include "middle-ram.hpp"
 #include "osmdata.hpp"
 #include "output-multi.hpp"
 #include "output.hpp"
-#include "parse-osmium.hpp"
 #include "taginfo-impl.hpp"
 
 #include "common-pg.hpp"
 
+#include <algorithm>
+#include <iterator>
+#include <string>
+#include <vector>
+
 namespace testing {
 
 inline void parse_file(options_t const &options,
+                       std::unique_ptr<dependency_manager_t> dependency_manager,
                        std::shared_ptr<middle_t> const &mid,
                        std::vector<std::shared_ptr<output_t>> const &outs,
-                       char const *filename = nullptr)
+                       char const *filename = nullptr,
+                       bool do_stop = true)
 {
-    //let osmdata orchestrate between the middle and the outs
-    osmdata_t osmdata(mid, outs);
+    osmdata_t osmdata{std::move(dependency_manager), mid, outs, options};
 
     osmdata.start();
-    parse_osmium_t parser(options.bbox, options.append, &osmdata);
 
-    std::string filep(TESTDATA_DIR);
-    filep += filename ? filename : options.input_files[0];
+    std::string filepath{TESTDATA_DIR};
+    if (filename) {
+        filepath += filename;
+    } else {
+        filepath += options.input_files[0];
+    }
+    osmium::io::File file{filepath};
+    osmdata.process_files({file}, options.bbox);
 
-    parser.stream_file(filep, "");
-
-    osmdata.stop();
+    if (do_stop) {
+        osmdata.stop();
+    }
 }
 
-class test_parse_t : public parse_osmium_t
+/**
+ * This is used as a helper to assemble OSM objects into an OPL file which
+ * can later be used as input for testing.
+ */
+class data_t
 {
 public:
-    using parse_osmium_t::parse_osmium_t;
+    data_t() = default;
 
-    void stream_buffer(char const *buf, std::string const &fmt)
+    template <typename CONTAINER>
+    data_t(CONTAINER const &objects)
     {
-        osmium::io::File infile(buf, strlen(buf), fmt);
-
-        osmium::io::Reader reader(infile);
-        osmium::apply(reader, *this);
-        reader.close();
+        std::copy(std::begin(objects), std::end(objects),
+                  std::back_inserter(m_objects));
     }
+
+    void add(char const *object) { m_objects.emplace_back(object); }
+
+    template <typename CONTAINER>
+    void add(CONTAINER const &objects)
+    {
+        std::copy(std::begin(objects), std::end(objects),
+                  std::back_inserter(m_objects));
+    }
+
+    void add(std::initializer_list<const char *> const &objects)
+    {
+        std::copy(std::begin(objects), std::end(objects),
+                  std::back_inserter(m_objects));
+    }
+
+    const char *operator()()
+    {
+        std::sort(m_objects.begin(), m_objects.end(),
+                  [](std::string const &a, std::string const &b) {
+                      return get_type_id(a) < get_type_id(b);
+                  });
+
+        m_result.clear();
+        for (auto const &obj : m_objects) {
+            assert(!obj.empty());
+            m_result.append(obj);
+            if (m_result.back() != '\n') {
+                m_result += '\n';
+            }
+        }
+
+        return m_result.c_str();
+    }
+
+private:
+    static std::pair<osmium::item_type, osmium::object_id_type>
+    get_type_id(std::string const &str)
+    {
+        std::string ti(str, 0, str.find(' '));
+        return osmium::string_to_object_id(ti.c_str(),
+                                           osmium::osm_entity_bits::nwr);
+    }
+
+    std::vector<std::string> m_objects;
+    std::string m_result;
 };
 
 namespace db {
@@ -63,51 +123,64 @@ namespace db {
 class import_t
 {
 public:
-    void run_import(options_t options, char const *data,
-                    std::string const &fmt = "opl")
+    void run_import(options_t options,
+                    std::initializer_list<std::string> input_data,
+                    std::string const &format = "opl")
     {
         options.database_options = m_db.db_options();
 
-        // setup the middle
         std::shared_ptr<middle_t> middle;
 
         if (options.slim) {
-            // middle gets its own copy-in thread
-            middle = std::shared_ptr<middle_t>(new middle_pgsql_t(&options));
+            middle = std::shared_ptr<middle_t>(new middle_pgsql_t{&options});
         } else {
-            middle = std::shared_ptr<middle_t>(new middle_ram_t(&options));
+            middle = std::shared_ptr<middle_t>(new middle_ram_t{&options});
         }
         middle->start();
 
-        // setup the output
-        auto outputs = output_t::create_outputs(
-            middle->get_query_instance(middle), options);
+        auto const outputs =
+            output_t::create_outputs(middle->get_query_instance(), options);
 
-        //let osmdata orchestrate between the middle and the outs
-        osmdata_t osmdata(middle, outputs);
+        auto dependency_manager = std::unique_ptr<dependency_manager_t>(
+            options.with_forward_dependencies
+                ? new full_dependency_manager_t{middle}
+                : new dependency_manager_t{});
+
+        osmdata_t osmdata{std::move(dependency_manager), middle, outputs,
+                          options};
 
         osmdata.start();
 
-        test_parse_t parser(options.bbox, options.append, &osmdata);
-
-        parser.stream_buffer(data, fmt);
+        std::vector<osmium::io::File> files;
+        for (auto const &data : input_data) {
+            files.emplace_back(data.data(), data.size(), format);
+        }
+        osmdata.process_files(files, options.bbox);
 
         osmdata.stop();
+    }
+
+    void run_import(options_t options, char const *data,
+                    std::string const &format = "opl")
+    {
+        run_import(options, std::initializer_list<std::string>{data}, format);
     }
 
     void run_file(options_t options, char const *file = nullptr)
     {
         options.database_options = m_db.db_options();
 
-        // setup the middle
         auto middle = std::make_shared<middle_ram_t>(&options);
         middle->start();
 
-        // setup the output
-        auto outputs = output_t::create_outputs(
-            middle->get_query_instance(middle), options);
+        auto const outputs =
+            output_t::create_outputs(middle->get_query_instance(), options);
 
-        parse_file(options, middle, outputs, file);
+        auto dependency_manager = std::unique_ptr<dependency_manager_t>(
+            new full_dependency_manager_t{middle});
+
+        parse_file(options, std::move(dependency_manager), middle, outputs,
+                   file);
     }
 
     void run_file_multi_output(options_t options,
@@ -127,16 +200,20 @@ public:
 
         auto mid_pgsql = std::make_shared<middle_pgsql_t>(&options);
         mid_pgsql->start();
-        auto midq = mid_pgsql->get_query_instance(mid_pgsql);
+        auto const midq = mid_pgsql->get_query_instance();
 
         // This actually uses the multi-backend with C transforms,
         // not Lua transforms. This is unusual and doesn't reflect real practice.
-        auto out_test = std::make_shared<output_multi_t>(
+        auto const out_test = std::make_shared<output_multi_t>(
             table_name, proc, columns, midq, options,
             std::make_shared<db_copy_thread_t>(
                 options.database_options.conninfo()));
 
-        parse_file(options, mid_pgsql, {out_test}, file);
+        auto dependency_manager = std::unique_ptr<dependency_manager_t>(
+            new full_dependency_manager_t{mid_pgsql});
+
+        parse_file(options, std::move(dependency_manager), mid_pgsql,
+                   {out_test}, file);
     }
 
     pg::conn_t connect() { return m_db.connect(); }

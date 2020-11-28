@@ -8,7 +8,6 @@
  * a strategy to combine both in an optimal way.
 */
 
-#include <climits>
 #include <cstddef>
 #include <cstdint>
 
@@ -30,19 +29,31 @@ struct ramNodeID
 class ramNodeBlock
 {
 public:
-    void reset_used() { _used = 0; }
-    void inc_used() { _used += 1; }
-    int used() const { return _used; }
+    void reset_used() noexcept { m_used = 0; }
+    void inc_used() noexcept { ++m_used; }
+    int used() const noexcept { return m_used; }
 
     osmium::Location *nodes = nullptr;
     int32_t block_offset = -1;
 
 private:
-    int32_t _used = 0;
+    int32_t m_used = 0;
 };
 
-struct node_ram_cache
+class node_ram_cache
 {
+    enum
+    {
+        BLOCK_SHIFT = 13
+    };
+
+public:
+    /**
+     * The default constructor creates a "dummy" cache which will never
+     * cache anything. It is used for testing.
+     */
+    node_ram_cache() = default;
+
     node_ram_cache(int strategy, int cacheSizeMB);
 
     node_ram_cache(node_ram_cache const &) = delete;
@@ -53,18 +64,45 @@ struct node_ram_cache
 
     ~node_ram_cache();
 
-    void set(osmid_t id, const osmium::Location &coord);
+    void set(osmid_t id, osmium::Location location);
     osmium::Location get(osmid_t id);
 
+    static constexpr osmid_t per_block() noexcept
+    {
+        return 1ULL << BLOCK_SHIFT;
+    }
+
 private:
+    static constexpr osmid_t num_blocks() noexcept
+    {
+        return 1ULL << (36U - BLOCK_SHIFT);
+    }
+
+    static constexpr int32_t id2block(osmid_t id) noexcept
+    {
+        /* allow for negative IDs */
+        return (id >> BLOCK_SHIFT) + num_blocks() / 2U;
+    }
+
+    static constexpr int id2offset(osmid_t id) noexcept
+    {
+        return id & (per_block() - 1U);
+    }
+
+    static constexpr osmid_t block2id(int32_t block, int offset) noexcept
+    {
+        return (((osmid_t)block - num_blocks() / 2U) << BLOCK_SHIFT) +
+               (osmid_t)offset;
+    }
+
     void percolate_up(int pos);
     osmium::Location *next_chunk();
-    void set_sparse(osmid_t id, const osmium::Location &coord);
-    void set_dense(osmid_t id, const osmium::Location &coord);
-    osmium::Location get_sparse(osmid_t id);
-    osmium::Location get_dense(osmid_t id);
+    void set_sparse(osmid_t id, osmium::Location location);
+    void set_dense(osmid_t id, osmium::Location location);
+    osmium::Location get_sparse(osmid_t id) const;
+    osmium::Location get_dense(osmid_t id) const;
 
-    int allocStrategy;
+    int allocStrategy = 0;
 
     ramNodeBlock *blocks = nullptr;
     int usedBlocks = 0;
@@ -81,13 +119,13 @@ private:
     osmid_t maxSparseId = 0;
 
     int64_t cacheUsed = 0;
-    int64_t cacheSize;
+    int64_t cacheSize = 0;
     osmid_t storedNodes = 0;
     osmid_t totalNodes = 0;
     long nodesCacheHits = 0;
     long nodesCacheLookups = 0;
 
-    int warn_node_order = 0;
+    bool m_warn_node_order = true;
 };
 
 #endif // OSM2PGSQL_NODE_RAM_CACHE_HPP

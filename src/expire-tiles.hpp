@@ -4,7 +4,9 @@
 #include <memory>
 #include <unordered_set>
 
+#include "logging.hpp"
 #include "osmtypes.hpp"
+#include "pgsql.hpp"
 
 class reprojection;
 class table_t;
@@ -18,9 +20,8 @@ class parser_t;
  */
 struct xy_coord_t
 {
-    uint32_t x;
-    uint32_t y;
-    xy_coord_t() : x(0), y(0) {}
+    uint32_t x = 0;
+    uint32_t y = 0;
 };
 
 /**
@@ -29,10 +30,9 @@ struct xy_coord_t
 class tile_output_t
 {
     FILE *outfile;
-    uint32_t outcount = 0;
 
 public:
-    tile_output_t(const char *filename);
+    explicit tile_output_t(char const *filename);
 
     ~tile_output_t();
 
@@ -53,8 +53,9 @@ struct expire_tiles
 
     int from_bbox(double min_lon, double min_lat, double max_lon,
                   double max_lat);
-    void from_wkb(const char *wkb, osmid_t osm_id);
+    void from_wkb(char const *wkb, osmid_t osm_id);
     int from_db(table_t *table, osmid_t osm_id);
+    int from_result(pg_result_t const &result, osmid_t osm_id);
 
     /**
      * Write the list of expired tiles to a file.
@@ -65,7 +66,7 @@ struct expire_tiles
      * \param filename name of the file
      * \param minzoom minimum zoom level
      */
-    void output_and_destroy(const char *filename, uint32_t minzoom);
+    void output_and_destroy(char const *filename, uint32_t minzoom);
 
     /**
      * Output expired tiles on all requested zoom levels.
@@ -91,9 +92,10 @@ struct expire_tiles
          * last_quadkey is initialized with a value which is not expected to exist
          * (larger than largest possible quadkey). */
         uint64_t last_quadkey = 1ULL << (2 * maxzoom);
+        std::size_t count = 0;
         for (std::vector<uint64_t>::const_iterator it = tiles_maxzoom.cbegin();
              it != tiles_maxzoom.cend(); ++it) {
-            for (uint32_t dz = 0; dz <= maxzoom - minzoom; dz++) {
+            for (uint32_t dz = 0; dz <= maxzoom - minzoom; ++dz) {
                 // scale down to the current zoom level
                 uint64_t qt_current = *it >> (dz * 2);
                 /* If dz > 0, there are propably multiple elements whose quadkey
@@ -105,9 +107,11 @@ struct expire_tiles
                 }
                 xy_coord_t xy = quadkey_to_xy(qt_current, maxzoom - dz);
                 output_writer.output_dirty_tile(xy.x, xy.y, maxzoom - dz);
+                ++count;
             }
             last_quadkey = *it;
         }
+        log_info("Wrote {} entries to expired tiles list", count);
     }
 
     /**
@@ -140,6 +144,12 @@ struct expire_tiles
     static xy_coord_t quadkey_to_xy(uint64_t quadkey, uint32_t zoom);
 
 private:
+
+    /**
+     * Converts from target coordinates to tile coordinates.
+     */
+    void coords_to_tile(double lon, double lat, double *tilex, double *tiley);
+
     /**
      * Expire a single tile.
      *

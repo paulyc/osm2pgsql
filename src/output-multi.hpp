@@ -9,7 +9,6 @@
 
 #include "expire-tiles.hpp"
 #include "geometry-processor.hpp"
-#include "id-tracker.hpp"
 #include "osmtypes.hpp"
 #include "output.hpp"
 
@@ -17,11 +16,11 @@
 #include <memory>
 #include <string>
 
+class options_t;
 class table_t;
 class tagtransform_t;
-struct export_list;
+class export_list;
 struct middle_query_t;
-struct options_t;
 
 class output_multi_t : public output_t
 {
@@ -43,16 +42,11 @@ public:
           std::shared_ptr<db_copy_thread_t> const &copy_thread) const override;
 
     void start() override;
-    void stop(osmium::thread::Pool *pool) override;
-    void commit() override;
+    void stop(thread_pool_t *pool) override;
+    void sync() override;
 
-    void enqueue_ways(pending_queue_t &job_queue, osmid_t id, size_t output_id,
-                      size_t &added) override;
-    void pending_way(osmid_t id, int exists) override;
-
-    void enqueue_relations(pending_queue_t &job_queue, osmid_t id,
-                           size_t output_id, size_t &added) override;
-    void pending_relation(osmid_t id, int exists) override;
+    void pending_way(osmid_t id) override;
+    void pending_relation(osmid_t id) override;
 
     void node_add(osmium::Node const &node) override;
     void way_add(osmium::Way *way) override;
@@ -66,9 +60,6 @@ public:
     void way_delete(osmid_t id) override;
     void relation_delete(osmid_t id) override;
 
-    size_t pending_count() const override;
-
-    void merge_pending_relations(output_t *other) override;
     void merge_expire_trees(output_t *other) override;
 
 protected:
@@ -79,7 +70,7 @@ protected:
     void process_relation(osmium::Relation const &rel, bool exists);
     void copy_node_to_table(osmid_t id, const std::string &geom,
                             taglist_t &tags);
-    void copy_to_table(const osmid_t id, geometry_processor::wkb_t const &geom,
+    void copy_to_table(osmid_t const id, geometry_processor::wkb_t const &geom,
                        taglist_t &tags);
 
     std::unique_ptr<tagtransform_t> m_tagtransform;
@@ -87,8 +78,6 @@ protected:
     std::shared_ptr<reprojection> m_proj;
     osmium::item_type const m_osm_type;
     std::unique_ptr<table_t> m_table;
-    id_tracker ways_pending_tracker, rels_pending_tracker;
-    std::shared_ptr<id_tracker> ways_done_tracker;
     expire_tiles m_expire;
     relation_helper m_relation_helper;
     osmium::memory::Buffer buffer;

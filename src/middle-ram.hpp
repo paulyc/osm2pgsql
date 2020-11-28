@@ -15,68 +15,75 @@
 
 #include "middle.hpp"
 
-struct node_ram_cache;
-struct options_t;
+class node_ram_cache;
+class options_t;
 
 template <typename T, size_t N>
 class cache_block_t
 {
-    std::array<std::unique_ptr<T>, N> arr;
+    std::array<std::unique_ptr<T>, N> m_arr;
 
 public:
-    void set(size_t idx, T *ele) { arr[idx].reset(ele); }
+    void set(size_t idx, T *ele) noexcept { m_arr[idx].reset(ele); }
 
-    T const *get(size_t idx) const { return arr[idx].get(); }
+    T const *get(size_t idx) const noexcept { return m_arr[idx].get(); }
 };
 
 template <typename T, size_t BLOCK_SHIFT>
 class elem_cache_t
 {
-    constexpr static size_t per_block() { return 1 << BLOCK_SHIFT; }
-    constexpr static size_t num_blocks() { return 1 << (32 - BLOCK_SHIFT); }
+    constexpr static size_t per_block() noexcept { return 1ULL << BLOCK_SHIFT; }
 
-    constexpr static size_t id2block(osmid_t id)
+    constexpr static size_t num_blocks() noexcept
+    {
+        return 1ULL << (32U - BLOCK_SHIFT);
+    }
+
+    constexpr static size_t id2block(osmid_t id) noexcept
     {
         /* + NUM_BLOCKS/2 allows for negative IDs */
-        return (id >> BLOCK_SHIFT) + num_blocks() / 2;
+        return (static_cast<size_t>(id) >> BLOCK_SHIFT) + num_blocks() / 2;
     }
 
-    constexpr static size_t id2offset(osmid_t id)
+    constexpr static size_t id2offset(osmid_t id) noexcept
     {
-        return id & (per_block() - 1);
+        return static_cast<size_t>(id) & (per_block() - 1U);
     }
 
-    typedef cache_block_t<T, 1 << BLOCK_SHIFT> element_t;
-    std::vector<std::unique_ptr<element_t>> arr;
+    using element_t = cache_block_t<T, 1U << BLOCK_SHIFT>;
+
+    std::vector<std::unique_ptr<element_t>> m_blocks;
 
 public:
-    elem_cache_t() : arr(num_blocks()) {}
+    elem_cache_t() : m_blocks(num_blocks()) {}
 
     void set(osmid_t id, T *ele)
     {
-        const size_t block = id2block(id);
+        size_t const block = id2block(id);
+        assert(block < m_blocks.size());
 
-        if (!arr[block]) {
-            arr[block].reset(new element_t());
+        if (!m_blocks[block]) {
+            m_blocks[block].reset(new element_t{});
         }
 
-        arr[block]->set(id2offset(id), ele);
+        m_blocks[block]->set(id2offset(id), ele);
     }
 
     T const *get(osmid_t id) const
     {
-        const size_t block = id2block(id);
+        size_t const block = id2block(id);
+        assert(block < m_blocks.size());
 
-        if (!arr[block]) {
-            return 0;
+        if (!m_blocks[block]) {
+            return nullptr;
         }
 
-        return arr[block]->get(id2offset(id));
+        return m_blocks[block]->get(id2offset(id));
     }
 
     void clear()
     {
-        for (auto &ele : arr) {
+        for (auto &ele : m_blocks) {
             ele.reset();
         }
     }
@@ -84,49 +91,31 @@ public:
 
 struct middle_ram_t : public middle_t, public middle_query_t
 {
-    middle_ram_t(options_t const *options);
-    virtual ~middle_ram_t();
+    explicit middle_ram_t(options_t const *options);
+    ~middle_ram_t() noexcept override = default;
 
-    void start() override;
-    void stop(osmium::thread::Pool &pool) override;
-    void analyze(void) override;
-    void commit(void) override;
+    void start() override {}
+    void stop(thread_pool_t &pool) override;
+    void analyze() override {}
+    void commit() override {}
 
-    void nodes_set(osmium::Node const &node) override;
+    void node_set(osmium::Node const &node) override;
     size_t nodes_get_list(osmium::WayNodeList *nodes) const override;
-    int nodes_delete(osmid_t id);
-    int node_changed(osmid_t id);
 
-    void ways_set(osmium::Way const &way) override;
-    bool ways_get(osmid_t id, osmium::memory::Buffer &buffer) const override;
+    void way_set(osmium::Way const &way) override;
+    bool way_get(osmid_t id, osmium::memory::Buffer &buffer) const override;
     size_t rel_way_members_get(osmium::Relation const &rel, rolelist_t *roles,
                                osmium::memory::Buffer &buffer) const override;
 
-    int ways_delete(osmid_t id);
-    int way_changed(osmid_t id);
+    bool relation_get(osmid_t id,
+                      osmium::memory::Buffer &buffer) const override;
+    void relation_set(osmium::Relation const &rel) override;
 
-    bool relations_get(osmid_t id,
-                       osmium::memory::Buffer &buffer) const override;
-    void relations_set(osmium::Relation const &rel) override;
-    int relations_delete(osmid_t id);
-    int relation_changed(osmid_t id);
+    void flush() override {}
 
-    void flush(osmium::item_type) override {}
-
-    idlist_t relations_using_way(osmid_t way_id) const override;
-
-    void iterate_ways(middle_t::pending_processor &pf) override;
-    void iterate_relations(pending_processor &pf) override;
-
-    size_t pending_count() const override;
-
-    std::shared_ptr<middle_query_t>
-    get_query_instance(std::shared_ptr<middle_t> const &mid) const override;
+    std::shared_ptr<middle_query_t> get_query_instance() override;
 
 private:
-    void release_ways();
-    void release_relations();
-
     struct ramWay
     {
         taglist_t tags;
@@ -135,8 +124,9 @@ private:
         ramWay(osmium::Way const &way, bool add_attributes)
         : tags(way.tags()), ndids(way.nodes())
         {
-            if (add_attributes)
+            if (add_attributes) {
                 tags.add_attributes(way);
+            }
         }
     };
 
@@ -148,23 +138,17 @@ private:
         ramRel(osmium::Relation const &rel, bool add_attributes)
         : tags(rel.tags()), members(rel.members())
         {
-            if (add_attributes)
+            if (add_attributes) {
                 tags.add_attributes(rel);
+            }
         }
     };
 
-    elem_cache_t<ramWay, 10> ways;
-    elem_cache_t<ramRel, 10> rels;
+    elem_cache_t<ramWay, 10> m_ways;
+    elem_cache_t<ramRel, 10> m_rels;
 
-    std::unique_ptr<node_ram_cache> cache;
-    bool extra_attributes;
-
-    /* the previous behaviour of iterate_ways was to delete all ways as they
-     * were being iterated. this doesn't work now that the output handles its
-     * own "done" status and output-specific "pending" status. however, the
-     * tests depend on the behaviour that ways will be unavailable once
-     * iterate_ways is complete, so this flag emulates that. */
-    bool simulate_ways_deleted;
+    std::unique_ptr<node_ram_cache> m_cache;
+    bool m_extra_attributes;
 };
 
 #endif // OSM2PGSQL_MIDDLE_RAM_HPP

@@ -26,7 +26,7 @@ static std::shared_ptr<db_target_descr_t> setup_table(std::string const &cols)
 }
 
 template <typename... ARGS>
-void add_row(copy_mgr_t &mgr, std::shared_ptr<db_target_descr_t> t,
+void add_row(copy_mgr_t &mgr, std::shared_ptr<db_target_descr_t> const &t,
              ARGS &&... args)
 {
     mgr.new_line(t);
@@ -37,13 +37,13 @@ void add_row(copy_mgr_t &mgr, std::shared_ptr<db_target_descr_t> t,
 }
 
 template <typename T>
-void add_array(copy_mgr_t &mgr, std::shared_ptr<db_target_descr_t> t, int id,
-               std::vector<T> const &values)
+void add_array(copy_mgr_t &mgr, std::shared_ptr<db_target_descr_t> const &t,
+               int id, std::vector<T> const &values)
 {
     mgr.new_line(t);
     mgr.add_column(id);
     mgr.new_array();
-    for (auto v : values) {
+    for (auto const &v : values) {
         mgr.add_array_elem(v);
     }
     mgr.finish_array();
@@ -53,7 +53,7 @@ void add_array(copy_mgr_t &mgr, std::shared_ptr<db_target_descr_t> t, int id,
 }
 
 static void
-add_hash(copy_mgr_t &mgr, std::shared_ptr<db_target_descr_t> t, int id,
+add_hash(copy_mgr_t &mgr, std::shared_ptr<db_target_descr_t> const &t, int id,
          std::vector<std::pair<std::string, std::string>> const &values)
 {
     mgr.new_line(t);
@@ -74,7 +74,7 @@ static void check_row(std::vector<std::string> const &row)
     auto conn = db.connect();
     auto res = conn.require_row("SELECT * FROM test_copy_mgr");
 
-    for (unsigned i = 0; i < row.size(); ++i) {
+    for (std::size_t i = 0; i < row.size(); ++i) {
         CHECK(res.get_value(0, (int)i) == row[i]);
     }
 }
@@ -158,15 +158,15 @@ TEST_CASE("copy_mgr_t")
                         "\"rr\rrr\",\"s\\\\l\"}"});
 
         auto c = db.connect();
-        CHECK(c.require_scalar<std::string>("SELECT a[4] from test_copy_mgr") ==
+        CHECK(c.require_scalar<std::string>("SELECT a[4] FROM test_copy_mgr") ==
               "with \"quote\"");
-        CHECK(c.require_scalar<std::string>("SELECT a[5] from test_copy_mgr") ==
+        CHECK(c.require_scalar<std::string>("SELECT a[5] FROM test_copy_mgr") ==
               "the\t");
-        CHECK(c.require_scalar<std::string>("SELECT a[6] from test_copy_mgr") ==
+        CHECK(c.require_scalar<std::string>("SELECT a[6] FROM test_copy_mgr") ==
               "line\nbreak");
-        CHECK(c.require_scalar<std::string>("SELECT a[7] from test_copy_mgr") ==
+        CHECK(c.require_scalar<std::string>("SELECT a[7] FROM test_copy_mgr") ==
               "rr\rrr");
-        CHECK(c.require_scalar<std::string>("SELECT a[8] from test_copy_mgr") ==
+        CHECK(c.require_scalar<std::string>("SELECT a[8] FROM test_copy_mgr") ==
               "s\\l");
     }
 

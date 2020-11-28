@@ -1,5 +1,8 @@
 # Multi Backend #
 
+**WARNING: the multi backend is deprecated and will be removed in future versions
+of osm2pgsql.**
+
 The multi backend is designed for custom table structures as an alternative
 to the standard [pgsql](pgsql.md) backend tables. It is intended to allow
 the configuration of a custom set of tables with hopefully fewer rows and fewer
@@ -70,6 +73,3 @@ An example based on the above is in [multi.lua](../multi.lua) and
 stops, one for buildings, and one for highways. Some Lua processing is done to
 unify tagging values.
 
-## Importing ##
-
-See: [Importing](pgsql.md#importing).

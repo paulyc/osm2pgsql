@@ -1,32 +1,36 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
-#include <ctime>
-#include <exception>
+#include <stdexcept>
+#include <string>
 #include <utility>
+#include <vector>
 
 #include "format.hpp"
+#include "logging.hpp"
 #include "options.hpp"
+#include "pgsql-helper.hpp"
 #include "table.hpp"
 #include "taginfo.hpp"
 #include "util.hpp"
 #include "wkb.hpp"
 
-#define BUFFER_SEND_SIZE 1024
-
 table_t::table_t(std::string const &name, std::string const &type,
                  columns_t const &columns, hstores_t const &hstore_columns,
-                 int const srid, bool const append, int const hstore_mode,
-                 std::shared_ptr<db_copy_thread_t> const &copy_thread)
+                 int const srid, bool const append, hstore_column hstore_mode,
+                 std::shared_ptr<db_copy_thread_t> const &copy_thread,
+                 std::string const &schema)
 : m_target(std::make_shared<db_target_descr_t>(name.c_str(), "osm_id")),
-  type(type), srid(fmt::to_string(srid)), append(append),
-  hstore_mode(hstore_mode), columns(columns), hstore_columns(hstore_columns),
-  m_copy(copy_thread)
+  m_type(type), m_srid(fmt::to_string(srid)), m_append(append),
+  m_hstore_mode(hstore_mode), m_columns(columns),
+  m_hstore_columns(hstore_columns), m_copy(copy_thread)
 {
+    m_target->schema = schema;
+
     // if we dont have any columns
-    if (columns.size() == 0 && hstore_mode != HSTORE_ALL) {
+    if (m_columns.empty() && m_hstore_mode != hstore_column::all) {
         throw std::runtime_error{
-            "No columns provided for table {}"_format(name)};
+            "No columns provided for table {}."_format(name)};
     }
 
     generate_copy_column_list();
@@ -34,10 +38,11 @@ table_t::table_t(std::string const &name, std::string const &type,
 
 table_t::table_t(table_t const &other,
                  std::shared_ptr<db_copy_thread_t> const &copy_thread)
-: m_conninfo(other.m_conninfo), m_target(other.m_target), type(other.type),
-  srid(other.srid), append(other.append), hstore_mode(other.hstore_mode),
-  columns(other.columns), hstore_columns(other.hstore_columns),
-  m_table_space(other.m_table_space), m_copy(copy_thread)
+: m_conninfo(other.m_conninfo), m_target(other.m_target), m_type(other.m_type),
+  m_srid(other.m_srid), m_append(other.m_append),
+  m_hstore_mode(other.m_hstore_mode), m_columns(other.m_columns),
+  m_hstore_columns(other.m_hstore_columns), m_table_space(other.m_table_space),
+  m_copy(copy_thread)
 {
     // if the other table has already started, then we want to execute
     // the same stuff to get into the same state. but if it hasn't, then
@@ -50,90 +55,74 @@ table_t::table_t(table_t const &other,
 
 void table_t::teardown() { m_sql_conn.reset(); }
 
-void table_t::commit() { m_copy.sync(); }
+void table_t::sync() { m_copy.sync(); }
 
 void table_t::connect()
 {
-    //connect
     m_sql_conn.reset(new pg_conn_t{m_conninfo});
     //let commits happen faster by delaying when they actually occur
-    m_sql_conn->exec("SET synchronous_commit TO off");
+    m_sql_conn->exec("SET synchronous_commit = off");
 }
 
-void table_t::start(std::string const &conninfo,
-                    boost::optional<std::string> const &table_space)
+void table_t::start(std::string const &conninfo, std::string const &table_space)
 {
     if (m_sql_conn) {
-        throw std::runtime_error(m_target->name +
-                                 " cannot start, its already started");
+        throw std::runtime_error{m_target->name +
+                                 " cannot start, its already started."};
     }
 
     m_conninfo = conninfo;
-    m_table_space = table_space ? " TABLESPACE " + table_space.get() : "";
+    m_table_space = tablespace_clause(table_space);
 
     connect();
-    fprintf(stderr, "Setting up table: %s\n", m_target->name.c_str());
+    log_info("Setting up table: {}", m_target->name);
     m_sql_conn->exec("SET client_min_messages = WARNING");
+    auto const qual_name = qualified_name(m_target->schema, m_target->name);
+    auto const qual_tmp_name = qualified_name(
+        m_target->schema, m_target->name + "_tmp");
+
     // we are making a new table
-    if (!append) {
+    if (!m_append) {
         m_sql_conn->exec(
-            "DROP TABLE IF EXISTS {} CASCADE"_format(m_target->name));
+            "DROP TABLE IF EXISTS {} CASCADE"_format(qual_name));
     }
 
     // These _tmp tables can be left behind if we run out of disk space.
-    m_sql_conn->exec("DROP TABLE IF EXISTS {}_tmp"_format(m_target->name));
+    m_sql_conn->exec("DROP TABLE IF EXISTS {}"_format(qual_tmp_name));
     m_sql_conn->exec("RESET client_min_messages");
 
     //making a new table
-    if (!append) {
+    if (!m_append) {
         //define the new table
-        auto sql = "CREATE UNLOGGED TABLE {} (osm_id {},"_format(
-            m_target->name, POSTGRES_OSMID_TYPE);
+        auto sql =
+            "CREATE UNLOGGED TABLE {} (osm_id int8,"_format(qual_name);
 
         //first with the regular columns
-        for (auto const &column : columns) {
+        for (auto const &column : m_columns) {
             sql += "\"{}\" {},"_format(column.name, column.type_name);
         }
 
         //then with the hstore columns
-        for (auto const &hcolumn : hstore_columns) {
+        for (auto const &hcolumn : m_hstore_columns) {
             sql += "\"{}\" hstore,"_format(hcolumn);
         }
 
         //add tags column
-        if (hstore_mode != HSTORE_NONE) {
+        if (m_hstore_mode != hstore_column::none) {
             sql += "\"tags\" hstore,";
         }
 
-        sql += "way geometry({},{}) )"_format(type, srid);
+        sql += "way geometry({},{}) )"_format(m_type, m_srid);
 
         // The final tables are created with CREATE TABLE AS ... SELECT * FROM ...
         // This means that they won't get this autovacuum setting, so it doesn't
         // doesn't need to be RESET on these tables
-        sql += " WITH ( autovacuum_enabled = FALSE )";
+        sql += " WITH (autovacuum_enabled = off)";
         //add the main table space
         sql += m_table_space;
 
         //create the table
         m_sql_conn->exec(sql);
-    } //appending
-    else {
-        //check the columns against those in the existing table
-        auto const res = m_sql_conn->query(
-            PGRES_TUPLES_OK, "SELECT * FROM {} LIMIT 0"_format(m_target->name));
-        for (auto const &column : columns) {
-            if (res.get_column_number(column.name) < 0) {
-                fmt::print(stderr, "Adding new column \"{}\" to \"{}\"\n",
-                           column.name, m_target->name);
-                m_sql_conn->exec("ALTER TABLE {} ADD COLUMN \"{}\" {}"_format(
-                    m_target->name, column.name, column.type_name));
-            }
-            // Note: we do not verify the type or delete unused columns
-        }
-
-        //TODO: check over hstore columns
-
-        //TODO: change the type of the geometry column if needed - this can only change to a more permissive type
     }
 
     prepare();
@@ -142,30 +131,31 @@ void table_t::start(std::string const &conninfo,
 void table_t::prepare()
 {
     //let postgres cache this query as it will presumably happen a lot
+    auto const qual_name = qualified_name(m_target->schema, m_target->name);
     m_sql_conn->exec(
-        "PREPARE get_wkb (" POSTGRES_OSMID_TYPE
-        ") AS SELECT way FROM {} WHERE osm_id = $1"_format(m_target->name));
+        "PREPARE get_wkb(int8) AS SELECT way FROM {} WHERE osm_id = $1"_format(
+            qual_name));
 }
 
 void table_t::generate_copy_column_list()
 {
     m_target->rows = "osm_id,";
     //first with the regular columns
-    for (auto const &column : columns) {
+    for (auto const &column : m_columns) {
         m_target->rows += '"';
         m_target->rows += column.name;
         m_target->rows += "\",";
     }
 
     //then with the hstore columns
-    for (auto const &hcolumn : hstore_columns) {
+    for (auto const &hcolumn : m_hstore_columns) {
         m_target->rows += '"';
         m_target->rows += hcolumn;
         m_target->rows += "\",";
     }
 
     //add tags column and geom column
-    if (hstore_mode != HSTORE_NONE) {
+    if (m_hstore_mode != hstore_column::none) {
         m_target->rows += "tags,way";
         //or just the geom column
     } else {
@@ -174,50 +164,48 @@ void table_t::generate_copy_column_list()
 }
 
 void table_t::stop(bool updateable, bool enable_hstore_index,
-                   boost::optional<std::string> const &table_space_index)
+                   std::string const &table_space_index)
 {
     // make sure that all data is written to the DB before continuing
     m_copy.sync();
 
-    if (!append) {
-        time_t start, end;
-        time(&start);
+    auto const qual_name = qualified_name(m_target->schema, m_target->name);
+    auto const qual_tmp_name = qualified_name(
+        m_target->schema, m_target->name + "_tmp");
 
-        fprintf(stderr, "Sorting data and creating indexes for %s\n",
-                m_target->name.c_str());
+    if (!m_append) {
+        util::timer_t timer;
+
+        log_info("Sorting data and creating indexes for {}", m_target->name);
 
         // Notices about invalid geometries are expected and can be ignored
         // because they say nothing about the validity of the geometry in OSM.
         m_sql_conn->exec("SET client_min_messages = WARNING");
 
         std::string sql =
-            "CREATE TABLE {0}_tmp {1} AS SELECT * FROM {0}"_format(
-                m_target->name, m_table_space);
+            "CREATE TABLE {} {} AS SELECT * FROM {}"_format(
+                qual_tmp_name, m_table_space, qual_name);
 
-        if (srid != "4326") {
+        if (m_srid != "4326") {
             // libosmium assures validity of geometries in 4326.
             // Transformation to another projection could make the geometry
             // invalid. Therefore add a filter to drop those.
             sql += " WHERE ST_IsValid(way)";
         }
 
-        auto res = m_sql_conn->query(
-            PGRES_TUPLES_OK,
-            "SELECT regexp_split_to_table(postgis_lib_version(), '\\.')");
-        auto const postgis_major = std::stoi(res.get_value_as_string(0, 0));
-        auto const postgis_minor = std::stoi(res.get_value_as_string(1, 0));
+        auto const postgis_version = get_postgis_version(*m_sql_conn);
 
         sql += " ORDER BY ";
-        if (postgis_major == 2 && postgis_minor < 4) {
-            fprintf(stderr, "Using GeoHash for clustering\n");
-            if (srid == "4326") {
+        if (postgis_version.major == 2 && postgis_version.minor < 4) {
+            log_info("Using GeoHash for clustering");
+            if (m_srid == "4326") {
                 sql += "ST_GeoHash(way,10)";
             } else {
                 sql += "ST_GeoHash(ST_Transform(ST_Envelope(way),4326),10)";
             }
             sql += " COLLATE \"C\"";
         } else {
-            fprintf(stderr, "Using native order for clustering\n");
+            log_info("Using native order for clustering");
             // Since Postgis 2.4 the order function for geometries gives
             // useful results.
             sql += "way";
@@ -225,82 +213,54 @@ void table_t::stop(bool updateable, bool enable_hstore_index,
 
         m_sql_conn->exec(sql);
 
-        m_sql_conn->exec("DROP TABLE {}"_format(m_target->name));
+        m_sql_conn->exec("DROP TABLE {}"_format(qual_name));
         m_sql_conn->exec(
-            "ALTER TABLE {0}_tmp RENAME TO {0}"_format(m_target->name));
-        fprintf(stderr, "Copying %s to cluster by geometry finished\n",
-                m_target->name.c_str());
-        fprintf(stderr, "Creating geometry index on %s\n",
-                m_target->name.c_str());
+            "ALTER TABLE {} RENAME TO {}"_format(qual_tmp_name, m_target->name));
+        log_info("Copying {} to cluster by geometry finished", m_target->name);
+        log_info("Creating geometry index on {}", m_target->name);
 
-        std::string tblspc_sql =
-            table_space_index ? "TABLESPACE " + table_space_index.get() : "";
         // Use fillfactor 100 for un-updatable imports
         m_sql_conn->exec("CREATE INDEX ON {} USING GIST (way) {} {}"_format(
-            m_target->name, (updateable ? "" : "WITH (FILLFACTOR=100)"),
-            tblspc_sql));
+            qual_name, (updateable ? "" : "WITH (fillfactor = 100)"),
+            tablespace_clause(table_space_index)));
 
         /* slim mode needs this to be able to apply diffs */
         if (updateable) {
-            fprintf(stderr, "Creating osm_id index on %s\n",
-                    m_target->name.c_str());
+            log_info("Creating osm_id index on {}", m_target->name);
             m_sql_conn->exec(
                 "CREATE INDEX ON {} USING BTREE (osm_id) {}"_format(
-                    m_target->name, tblspc_sql));
-            if (srid != "4326") {
-                m_sql_conn->exec(
-                    "CREATE OR REPLACE FUNCTION {}_osm2pgsql_valid()\n"
-                    "RETURNS TRIGGER AS $$\n"
-                    "BEGIN\n"
-                    "  IF ST_IsValid(NEW.way) THEN \n"
-                    "    RETURN NEW;\n"
-                    "  END IF;\n"
-                    "  RETURN NULL;\n"
-                    "END;"
-                    "$$ LANGUAGE plpgsql;"_format(m_target->name));
-
-                m_sql_conn->exec(
-                    "CREATE TRIGGER {0}_osm2pgsql_valid "
-                    "BEFORE INSERT OR UPDATE\n"
-                    "  ON {0}\n"
-                    "    FOR EACH ROW EXECUTE PROCEDURE "
-                    "{0}_osm2pgsql_valid();"_format(m_target->name));
+                    qual_name, tablespace_clause(table_space_index)));
+            if (m_srid != "4326") {
+                create_geom_check_trigger(m_sql_conn.get(), m_target->schema,
+                                          m_target->name, "way");
             }
         }
         /* Create hstore index if selected */
         if (enable_hstore_index) {
-            fprintf(stderr, "Creating hstore indexes on %s\n",
-                    m_target->name.c_str());
-            if (hstore_mode != HSTORE_NONE) {
+            log_info("Creating hstore indexes on {}", m_target->name);
+            if (m_hstore_mode != hstore_column::none) {
                 m_sql_conn->exec(
                     "CREATE INDEX ON {} USING GIN (tags) {}"_format(
-                        m_target->name,
-                        (table_space_index
-                             ? "TABLESPACE " + table_space_index.get()
-                             : "")));
+                        qual_name, tablespace_clause(table_space_index)));
             }
-            for (size_t i = 0; i < hstore_columns.size(); ++i) {
+            for (auto const &hcolumn : m_hstore_columns) {
                 m_sql_conn->exec(
                     "CREATE INDEX ON {} USING GIN (\"{}\") {}"_format(
-                        m_target->name, hstore_columns[i],
-                        (table_space_index
-                             ? "TABLESPACE " + table_space_index.get()
-                             : "")));
+                        qual_name, hcolumn,
+                        tablespace_clause(table_space_index)));
             }
         }
-        fprintf(stderr, "Creating indexes on %s finished\n",
-                m_target->name.c_str());
-        m_sql_conn->exec("ANALYZE {}"_format(m_target->name));
-        time(&end);
-        fprintf(stderr, "All indexes on %s created in %ds\n",
-                m_target->name.c_str(), (int)(end - start));
+        log_info("Creating indexes on {} finished", m_target->name);
+        m_sql_conn->exec("ANALYZE {}"_format(qual_name));
+        log_info("All indexes on {} created in {}", m_target->name,
+                 util::human_readable_duration(timer.stop()));
     }
     teardown();
 
-    fprintf(stderr, "Completed %s\n", m_target->name.c_str());
+    log_info("Completed table {}", m_target->name);
 }
 
-void table_t::delete_row(const osmid_t id)
+void table_t::delete_row(osmid_t const id)
 {
     m_copy.new_line(m_target);
     m_copy.delete_object(id);
@@ -317,18 +277,18 @@ void table_t::write_row(osmid_t id, taglist_t const &tags,
     // used to remember which columns have been written out already.
     std::vector<bool> used;
 
-    if (hstore_mode != HSTORE_NONE) {
+    if (m_hstore_mode != hstore_column::none) {
         used.assign(tags.size(), false);
     }
 
     //get the regular columns' values
-    write_columns(tags, hstore_mode == HSTORE_NORM ? &used : nullptr);
+    write_columns(tags, m_hstore_mode == hstore_column::norm ? &used : nullptr);
 
     //get the hstore columns' values
     write_hstore_columns(tags);
 
     //get the key value pairs for the tags column
-    if (hstore_mode != HSTORE_NONE) {
+    if (m_hstore_mode != hstore_column::none) {
         write_tags_column(tags, used);
     }
 
@@ -341,8 +301,7 @@ void table_t::write_row(osmid_t id, taglist_t const &tags,
 
 void table_t::write_columns(taglist_t const &tags, std::vector<bool> *used)
 {
-    //for each column
-    for (auto const &column : columns) {
+    for (auto const &column : m_columns) {
         std::size_t const idx = tags.indexof(column.name);
         if (idx != std::numeric_limits<std::size_t>::max()) {
             escape_type(tags[idx].value, column.type);
@@ -375,19 +334,15 @@ void table_t::write_tags_column(taglist_t const &tags,
 }
 
 /* write an hstore column to the database */
-void table_t::write_hstore_columns(const taglist_t &tags)
+void table_t::write_hstore_columns(taglist_t const &tags)
 {
-    //iterate over all configured hstore columns in the options
-    for (auto const &hstore_column : hstore_columns) {
+    for (auto const &hcolumn : m_hstore_columns) {
         bool added = false;
 
-        //iterate through the list of tags, first one is always null
-        for (auto const &xtags : tags) {
+        for (auto const &tag : tags) {
             //check if the tag's key starts with the name of the hstore column
-            if (xtags.key.compare(0, hstore_column.size(), hstore_column) ==
-                0) {
-                //generate the short key name, somehow pointer arithmetic works against the key string...
-                char const *shortkey = xtags.key.c_str() + hstore_column.size();
+            if (tag.key.compare(0, hcolumn.size(), hcolumn) == 0) {
+                char const *const shortkey = &tag.key[hcolumn.size()];
 
                 //and pack the shortkey with its value into the hstore
                 //hstore ASCII representation looks like "key"=>"value"
@@ -396,7 +351,7 @@ void table_t::write_hstore_columns(const taglist_t &tags)
                     m_copy.new_hash();
                 }
 
-                m_copy.add_hash_elem(shortkey, xtags.value.c_str());
+                m_copy.add_hash_elem(shortkey, tag.value.c_str());
             }
         }
 
@@ -409,20 +364,22 @@ void table_t::write_hstore_columns(const taglist_t &tags)
 }
 
 /* Escape data appropriate to the type */
-void table_t::escape_type(const std::string &value, ColumnType flags)
+void table_t::escape_type(std::string const &value, ColumnType flags)
 {
     switch (flags) {
-    case COLUMN_TYPE_INT: {
+    case ColumnType::INT: {
         // For integers we take the first number, or the average if it's a-b
         long long from, to;
         // limit number of digits parsed to avoid undefined behaviour in sscanf
-        int items = sscanf(value.c_str(), "%18lld-%18lld", &from, &to);
+        int const items =
+            std::sscanf(value.c_str(), "%18lld-%18lld", &from, &to);
         if (items == 1 && from <= std::numeric_limits<int32_t>::max() &&
             from >= std::numeric_limits<int32_t>::min()) {
             m_copy.add_column(from);
         } else if (items == 2) {
             // calculate mean while avoiding overflows
-            int64_t mean = (from / 2) + (to / 2) + ((from % 2 + to % 2) / 2);
+            int64_t const mean =
+                (from / 2) + (to / 2) + ((from % 2 + to % 2) / 2);
             if (mean <= std::numeric_limits<int32_t>::max() &&
                 mean >= std::numeric_limits<int32_t>::min()) {
                 m_copy.add_column(mean);
@@ -434,29 +391,30 @@ void table_t::escape_type(const std::string &value, ColumnType flags)
         }
         break;
     }
-    case COLUMN_TYPE_REAL:
+    case ColumnType::REAL:
         /* try to "repair" real values as follows:
-             * assume "," to be a decimal mark which need to be replaced by "."
-             * like int4 take the first number, or the average if it's a-b
-             * assume SI unit (meters)
-             * convert feet to meters (1 foot = 0.3048 meters)
-             * reject anything else
-             */
+         * assume "," to be a decimal mark which need to be replaced by "."
+         * like int4 take the first number, or the average if it's a-b
+         * assume SI unit (meters)
+         * convert feet to meters (1 foot = 0.3048 meters)
+         * reject anything else
+         */
         {
             std::string escaped{value};
             std::replace(escaped.begin(), escaped.end(), ',', '.');
 
             double from, to;
-            int items = sscanf(escaped.c_str(), "%lf-%lf", &from, &to);
+            int const items =
+                std::sscanf(escaped.c_str(), "%lf-%lf", &from, &to);
             if (items == 1) {
                 if (escaped.size() > 1 &&
-                    escaped.substr(escaped.size() - 2).compare("ft") == 0) {
+                    escaped.substr(escaped.size() - 2) == "ft") {
                     from *= 0.3048;
                 }
                 m_copy.add_column(from);
             } else if (items == 2) {
                 if (escaped.size() > 1 &&
-                    escaped.substr(escaped.size() - 2).compare("ft") == 0) {
+                    escaped.substr(escaped.size() - 2) == "ft") {
                     from *= 0.3048;
                     to *= 0.3048;
                 }
@@ -466,23 +424,14 @@ void table_t::escape_type(const std::string &value, ColumnType flags)
             }
             break;
         }
-    case COLUMN_TYPE_TEXT:
-        //just a string
+    case ColumnType::TEXT:
         m_copy.add_column(value);
         break;
     }
 }
 
-table_t::wkb_reader table_t::get_wkb_reader(const osmid_t id)
+table_t::wkb_reader table_t::get_wkb_reader(osmid_t id)
 {
-    char tmp[32];
-    snprintf(tmp, sizeof(tmp), "%" PRIdOSMID, id);
-    char const *param_values[] = {tmp};
-
-    // the prepared statement get_wkb will behave differently depending on the
-    // sql_conn
-    // each table has its own sql_connection with the get_way referring to the
-    // appropriate table
-    auto res = m_sql_conn->exec_prepared("get_wkb", 1, param_values);
+    auto res = m_sql_conn->exec_prepared("get_wkb", id);
     return wkb_reader{std::move(res)};
 }

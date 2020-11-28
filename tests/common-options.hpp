@@ -17,6 +17,7 @@ public:
         m_opt.num_procs = 1;
         m_opt.cache = 2;
         m_opt.append = false;
+        m_opt.projection = reprojection::create_projection(PROJ_SPHERE_MERC);
     }
 
     operator options_t() const { return m_opt; }
@@ -55,6 +56,14 @@ public:
         return *this;
     }
 
+    opt_t &flex(char const *style)
+    {
+        m_opt.output_backend = "flex";
+        m_opt.style = TESTDATA_DIR;
+        m_opt.style += style;
+        return *this;
+    }
+
     opt_t &flatnodes()
     {
         m_opt.flat_node_file =
@@ -72,7 +81,13 @@ public:
 
     opt_t &srs(int srs)
     {
-        m_opt.projection.reset(reprojection::create_projection(srs));
+        m_opt.projection = reprojection::create_projection(srs);
+        return *this;
+    }
+
+    opt_t &extra_attributes() noexcept
+    {
+        m_opt.extra_attributes = true;
         return *this;
     }
 

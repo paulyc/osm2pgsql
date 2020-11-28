@@ -1,5 +1,6 @@
 #include "config.h"
 #include "format.hpp"
+#include "logging.hpp"
 #include "options.hpp"
 #include "sprompt.hpp"
 
@@ -8,7 +9,6 @@
 #include <cstring>
 #include <getopt.h>
 #include <osmium/version.hpp>
-#include <sstream>
 #include <stdexcept>
 #include <thread> // for number of threads
 
@@ -33,7 +33,7 @@ static char const *program_name(char const *name)
 }
 
 namespace {
-const char *short_options = "ab:cd:KhlmMp:suvU:WH:P:i:IE:C:S:e:o:O:xkjGz:r:VF:";
+char const *short_options = "ab:cd:KhlmMp:suvU:WH:P:i:IE:C:S:e:o:O:xkjGz:r:VF:";
 const struct option long_options[] = {
     {"append", no_argument, nullptr, 'a'},
     {"bbox", required_argument, nullptr, 'b'},
@@ -58,10 +58,17 @@ const struct option long_options[] = {
     {"input-reader", required_argument, nullptr, 'r'},
     {"keep-coastlines", no_argument, nullptr, 'K'},
     {"latlong", no_argument, nullptr, 'l'},
+    {"log-level", required_argument, nullptr, 400},
+    {"log-progress", required_argument, nullptr, 401},
+    {"log-sql", no_argument, nullptr, 402},
+    {"log-sql-data", no_argument, nullptr, 403},
     {"merc", no_argument, nullptr, 'm'},
+    {"middle-schema", required_argument, nullptr, 215},
+    {"middle-way-node-index-id-shift", required_argument, nullptr, 300},
     {"multi-geometry", no_argument, nullptr, 'G'},
     {"number-processes", required_argument, nullptr, 205},
     {"output", required_argument, nullptr, 'O'},
+    {"output-pgsql-schema", required_argument, nullptr, 216},
     {"password", no_argument, nullptr, 'W'},
     {"port", required_argument, nullptr, 'P'},
     {"prefix", required_argument, nullptr, 'p'},
@@ -78,17 +85,18 @@ const struct option long_options[] = {
     {"username", required_argument, nullptr, 'U'},
     {"verbose", no_argument, nullptr, 'v'},
     {"version", no_argument, nullptr, 'V'},
+    {"with-forward-dependencies", required_argument, nullptr, 217},
     {nullptr, 0, nullptr, 0}};
 
 void short_usage(char *arg0)
 {
-    throw std::runtime_error{"Usage error. For further information see:\n"
-                             "\t{} -h|--help\n"_format(program_name(arg0))};
+    throw std::runtime_error{"Usage error. For further information call:"
+                             " {} --help"_format(program_name(arg0))};
 }
 
-void long_usage(char *arg0, bool verbose = false)
+void long_usage(char const *arg0, bool verbose)
 {
-    const char *name = program_name(arg0);
+    char const *const name = program_name(arg0);
 
     printf("Usage:\n");
     printf("\t%s [options] planet.osm\n", name);
@@ -105,8 +113,11 @@ void long_usage(char *arg0, bool verbose = false)
        -c|--create      Remove existing data from the database. This is the\n\
                         default if --append is not specified.\n\
        -l|--latlong     Store data in degrees of latitude & longitude.\n\
-       -m|--merc        Store data in proper spherical mercator (default).\n\
-       -E|--proj num    Use projection EPSG:num.\n\
+       -m|--merc        Store data in proper spherical mercator (default).\n"
+#ifdef HAVE_GENERIC_PROJ
+                 "       -E|--proj num    Use projection EPSG:num.\n"
+#endif
+                 "\
        -s|--slim        Store temporary data in the database. This greatly\n\
                         reduces the RAM usage but is much slower. This switch is\n\
                         required if you want to update with --append later.\n\
@@ -120,9 +131,13 @@ void long_usage(char *arg0, bool verbose = false)
                         information in slim mode instead of in PostgreSQL.\n\
                         This file is a single > 40Gb large file. Only recommended\n\
                         for full planet imports. Default is disabled.\n\
+          --middle-schema   Schema to use for middle tables (default: none)\n\
+          --with-forward-dependencies true|false Propagate changes from nodes to ways\n\
+                             and node/way members to relations (Default: true).\n\
     \n\
     Database options:\n\
-       -d|--database    The name of the PostgreSQL database to connect to.\n\
+       -d|--database    The name of the PostgreSQL database to connect to or\n\
+                        a PostgreSQL conninfo string.\n\
        -U|--username    PostgreSQL user name (specify passsword in PGPASSWORD\n\
                         environment variable or use -W).\n\
        -W|--password    Force password prompt.\n\
@@ -179,6 +194,10 @@ void long_usage(char *arg0, bool verbose = false)
 #endif
         printf("%s", "\
     \n\
+    Middle options (experts only):\n\
+          --middle-way-node-index-id-shift shift  Set ID shift for bucket\n\
+                             index. See documentation for details.\n\
+    \n\
     Expiry options:\n\
        -e|--expire-tiles [min_zoom-]max_zoom    Create a tile expiry list.\n\
                              Zoom levels must be larger than 0 and smaller\n\
@@ -199,10 +218,12 @@ void long_usage(char *arg0, bool verbose = false)
                         pbf       - OSM binary format.\n\
        -O|--output      Output backend.\n\
                         pgsql - Output to a PostGIS database (default)\n\
+                        flex - More flexible output to PostGIS database\n\
                         multi - Multiple Custom Table Output to a PostGIS \n\
-                            database (requires style file for configuration)\n\
+                                database (deprecated)\n\
                         gazetteer - Output to a PostGIS database for Nominatim\n\
-                        null - No output. Useful for testing. Still creates tables if --slim is specified.\n");
+                        null - No output. Useful for testing. Still creates tables if --slim is specified.\n\
+          --output-pgsql-schema Schema to use for pgsql/multi output tables (default: none)\n");
 #ifdef HAVE_LUA
         printf("\
           --tag-transform-script  Specify a lua script to handle tag filtering and normalisation\n\
@@ -220,6 +241,10 @@ void long_usage(char *arg0, bool verbose = false)
                         By default natural=coastline tagged data will be discarded\n\
                         because renderers usually have shape files for them.\n\
           --reproject-area   compute area column using spherical mercator coordinates.\n\
+          --log-level=LVL Set log level ('debug', 'info' (default), 'warn', or 'error').\n\
+          --log-progress=VAL Log progress ('true', 'false', or 'auto' (default)).\n\
+          --log-sql     Enable logging of SQL commands for debugging.\n\
+          --log-sql-data Enable logging of SQL data for debugging.\n\
        -h|--help        Help information.\n\
        -v|--verbose     Verbose output.\n");
     } else {
@@ -253,37 +278,48 @@ void long_usage(char *arg0, bool verbose = false)
 
 } // anonymous namespace
 
-database_options_t::database_options_t()
-: db(boost::none), username(boost::none), host(boost::none),
-  password(boost::none), port(boost::none)
-{}
+static bool compare_prefix(std::string const &str,
+                           std::string const &prefix) noexcept
+{
+    return std::strncmp(str.c_str(), prefix.c_str(), prefix.size()) == 0;
+}
 
 std::string database_options_t::conninfo() const
 {
-    std::ostringstream out;
-
-    out << "fallback_application_name='osm2pgsql'";
-    if (db) {
-        out << " dbname='" << *db << "'";
-    }
-    if (username) {
-        out << " user='" << *username << "'";
-    }
-    if (password) {
-        out << " password='" << *password << "'";
-    }
-    if (host) {
-        out << " host='" << *host << "'";
-    }
-    if (port) {
-        out << " port='" << *port << "'";
+    if (compare_prefix(db, "postgresql://") ||
+        compare_prefix(db, "postgres://")) {
+        return db;
     }
 
-    return out.str();
+    std::string out{"fallback_application_name='osm2pgsql'"};
+
+    if (std::strchr(db.c_str(), '=') != nullptr) {
+        out += " ";
+        out += db;
+        return out;
+    }
+
+    if (!db.empty()) {
+        out += " dbname='{}'"_format(db);
+    }
+    if (!username.empty()) {
+        out += " user='{}'"_format(username);
+    }
+    if (!password.empty()) {
+        out += " password='{}'"_format(password);
+    }
+    if (!host.empty()) {
+        out += " host='{}'"_format(host);
+    }
+    if (!port.empty()) {
+        out += " port='{}'"_format(port);
+    }
+
+    return out;
 }
 
 options_t::options_t()
-: projection(reprojection::create_projection(PROJ_SPHERE_MERC)),
+:
 #ifdef __amd64__
   alloc_chunkwise(ALLOC_SPARSE | ALLOC_DENSE),
 #else
@@ -292,16 +328,44 @@ options_t::options_t()
   num_procs((int)std::min(4U, std::thread::hardware_concurrency()))
 {
     if (num_procs < 1) {
-        fprintf(stderr, "WARNING: unable to detect number of hardware threads "
-                        "supported!\n");
+        log_warn("Unable to detect number of hardware threads supported!"
+                 " Using single thread.");
         num_procs = 1;
     }
 }
 
-options_t::~options_t() {}
+static osmium::Box parse_bbox(char const *bbox)
+{
+    double minx;
+    double maxx;
+    double miny;
+    double maxy;
+
+    int const n = sscanf(bbox, "%lf,%lf,%lf,%lf", &minx, &miny, &maxx, &maxy);
+    if (n != 4) {
+        throw std::runtime_error{"Bounding box must be specified like: "
+                                 "minlon,minlat,maxlon,maxlat."};
+    }
+
+    if (maxx <= minx) {
+        throw std::runtime_error{
+            "Bounding box failed due to maxlon <= minlon."};
+    }
+
+    if (maxy <= miny) {
+        throw std::runtime_error{
+            "Bounding box failed due to maxlat <= minlat."};
+    }
+
+    log_info("Applying bounding box: {},{} to {},{}", minx, miny, maxx, maxy);
+
+    return osmium::Box{minx, miny, maxx, maxy};
+}
 
 options_t::options_t(int argc, char *argv[]) : options_t()
 {
+    bool help_verbose = false; // Will be set when -v/--verbose is set
+
     int c;
 
     //keep going while there are args left to handle
@@ -318,13 +382,14 @@ options_t::options_t(int argc, char *argv[]) : options_t()
             append = true;
             break;
         case 'b':
-            bbox = optarg;
+            bbox = parse_bbox(optarg);
             break;
         case 'c':
             create = true;
             break;
         case 'v':
-            verbose = true;
+            help_verbose = true;
+            get_logger().set_level(log_level::debug);
             break;
         case 's':
             slim = true;
@@ -333,13 +398,17 @@ options_t::options_t(int argc, char *argv[]) : options_t()
             keep_coastlines = true;
             break;
         case 'l':
-            projection.reset(reprojection::create_projection(PROJ_LATLONG));
+            projection = reprojection::create_projection(PROJ_LATLONG);
             break;
         case 'm':
-            projection.reset(reprojection::create_projection(PROJ_SPHERE_MERC));
+            projection = reprojection::create_projection(PROJ_SPHERE_MERC);
             break;
         case 'E':
-            projection.reset(reprojection::create_projection(atoi(optarg)));
+#ifdef HAVE_GENERIC_PROJ
+            projection = reprojection::create_projection(atoi(optarg));
+#else
+            throw std::runtime_error{"Generic projections not available."};
+#endif
             break;
         case 'p':
             prefix = optarg;
@@ -366,7 +435,8 @@ options_t::options_t(int argc, char *argv[]) : options_t()
             style = optarg;
             break;
         case 'i':
-            tblsmain_index = tblsslim_index = optarg;
+            tblsmain_index = optarg;
+            tblsslim_index = tblsmain_index;
             break;
         case 200:
             tblsslim_data = optarg;
@@ -382,18 +452,18 @@ options_t::options_t(int argc, char *argv[]) : options_t()
             break;
         case 'e':
             if (!optarg || optarg[0] == '-') {
-                throw std::runtime_error(
+                throw std::runtime_error{
                     "Missing argument for option --expire-tiles. Zoom "
-                    "levels must be positive.\n");
+                    "levels must be positive."};
             }
             char *next_char;
             expire_tiles_zoom_min =
                 static_cast<uint32_t>(std::strtoul(optarg, &next_char, 10));
             if (expire_tiles_zoom_min == 0) {
-                throw std::runtime_error(
+                throw std::runtime_error{
                     "Bad argument for option --expire-tiles. "
                     "Minimum zoom level must be larger "
-                    "than 0.\n");
+                    "than 0."};
             }
             // The first character after the number is ignored because that is the separating hyphen.
             if (*next_char == '-') {
@@ -404,20 +474,20 @@ options_t::options_t(int argc, char *argv[]) : options_t()
                     expire_tiles_zoom = static_cast<uint32_t>(
                         std::strtoul(next_char, &after_maxzoom, 10));
                     if (expire_tiles_zoom == 0 || *after_maxzoom != '\0') {
-                        throw std::runtime_error("Invalid maximum zoom level "
-                                                 "given for tile expiry.\n");
+                        throw std::runtime_error{"Invalid maximum zoom level "
+                                                 "given for tile expiry."};
                     }
                 } else {
-                    throw std::runtime_error(
-                        "Invalid maximum zoom level given for tile expiry.\n");
+                    throw std::runtime_error{
+                        "Invalid maximum zoom level given for tile expiry."};
                 }
             } else if (*next_char == '\0') {
                 // end of string, no second zoom level given
                 expire_tiles_zoom = expire_tiles_zoom_min;
             } else {
-                throw std::runtime_error("Minimum and maximum zoom level for "
+                throw std::runtime_error{"Minimum and maximum zoom level for "
                                          "tile expiry must be separated by "
-                                         "'-'.\n");
+                                         "'-'."};
             }
             break;
         case 'o':
@@ -428,35 +498,41 @@ options_t::options_t(int argc, char *argv[]) : options_t()
             break;
         case 'O':
             output_backend = optarg;
+            if (output_backend == "multi") {
+                log_warn("The 'multi' output is deprecated and will be removed."
+                         "Please switch to the 'flex' output.");
+            }
             break;
         case 'x':
             extra_attributes = true;
             break;
         case 'k':
-            if (hstore_mode != HSTORE_NONE) {
-                throw std::runtime_error("You can not specify both --hstore "
-                                         "(-k) and --hstore-all (-j)\n");
+            if (hstore_mode != hstore_column::none) {
+                throw std::runtime_error{"You can not specify both --hstore "
+                                         "(-k) and --hstore-all (-j)."};
             }
-            hstore_mode = HSTORE_NORM;
+            hstore_mode = hstore_column::norm;
             break;
         case 208:
             hstore_match_only = true;
             break;
         case 'j':
-            if (hstore_mode != HSTORE_NONE) {
-                throw std::runtime_error("You can not specify both --hstore "
-                                         "(-k) and --hstore-all (-j)\n");
+            if (hstore_mode != hstore_column::none) {
+                throw std::runtime_error{"You can not specify both --hstore "
+                                         "(-k) and --hstore-all (-j)."};
             }
-            hstore_mode = HSTORE_ALL;
+            hstore_mode = hstore_column::all;
             break;
         case 'z':
-            hstore_columns.push_back(optarg);
+            hstore_columns.emplace_back(optarg);
             break;
         case 'G':
             enable_multi = true;
             break;
         case 'r':
-            input_reader = optarg;
+            if (std::strcmp(optarg, "auto") != 0) {
+                input_format = optarg;
+            }
             break;
         case 'h':
             long_usage_bool = true;
@@ -465,17 +541,17 @@ options_t::options_t(int argc, char *argv[]) : options_t()
             parallel_indexing = false;
             break;
         case 204:
-            if (strcmp(optarg, "dense") == 0) {
+            if (std::strcmp(optarg, "dense") == 0) {
                 alloc_chunkwise = ALLOC_DENSE;
-            } else if (strcmp(optarg, "chunk") == 0) {
+            } else if (std::strcmp(optarg, "chunk") == 0) {
                 alloc_chunkwise = ALLOC_DENSE | ALLOC_DENSE_CHUNK;
-            } else if (strcmp(optarg, "sparse") == 0) {
+            } else if (std::strcmp(optarg, "sparse") == 0) {
                 alloc_chunkwise = ALLOC_SPARSE;
-            } else if (strcmp(optarg, "optimized") == 0) {
+            } else if (std::strcmp(optarg, "optimized") == 0) {
                 alloc_chunkwise = ALLOC_DENSE | ALLOC_SPARSE;
             } else {
                 throw std::runtime_error{
-                    "Unrecognized cache strategy {}.\n"_format(optarg)};
+                    "Unrecognized cache strategy {}."_format(optarg)};
             }
             break;
         case 205:
@@ -498,18 +574,75 @@ options_t::options_t(int argc, char *argv[]) : options_t()
             reproject_area = true;
             break;
         case 'V':
-            fprintf(stderr, "Compiled using the following library versions:\n");
-            fprintf(stderr, "Libosmium %s\n", LIBOSMIUM_VERSION_STRING);
+            fmt::print(stderr, "Compiled using the following library versions:\n");
+            fmt::print(stderr, "Libosmium {}\n", LIBOSMIUM_VERSION_STRING);
+            fmt::print(stderr, "Proj {}\n", get_proj_version());
 #ifdef HAVE_LUA
-            fprintf(stderr, "%s", LUA_RELEASE);
+            fmt::print(stderr, "{}", LUA_RELEASE);
 #ifdef HAVE_LUAJIT
-            fprintf(stderr, " (%s)", LUAJIT_VERSION);
+            fmt::print(stderr, " ({})", LUAJIT_VERSION);
 #endif
 #else
             fprintf(stderr, "Lua support not included");
 #endif
             fprintf(stderr, "\n");
             exit(EXIT_SUCCESS);
+            break;
+        case 215:
+            middle_dbschema = optarg;
+            break;
+        case 216:
+            output_dbschema = optarg;
+            break;
+        case 217:
+            if (std::strcmp(optarg, "false") == 0) {
+                with_forward_dependencies = false;
+            } else if (std::strcmp(optarg, "true") == 0) {
+                with_forward_dependencies = true;
+            } else {
+                throw std::runtime_error{
+                    "Unknown value for --with-forward-dependencies option: {}\n"_format(
+                        optarg)};
+            }
+            break;
+        case 300:
+            way_node_index_id_shift = atoi(optarg);
+            break;
+        case 400: // --log-level=LEVEL
+            if (std::strcmp(optarg, "debug") == 0) {
+                get_logger().set_level(log_level::debug);
+            } else if (std::strcmp(optarg, "info") == 0) {
+                get_logger().set_level(log_level::info);
+            } else if ((std::strcmp(optarg, "warn") == 0) ||
+                       (std::strcmp(optarg, "warning") == 0)) {
+                get_logger().set_level(log_level::warn);
+            } else if (std::strcmp(optarg, "error") == 0) {
+                get_logger().set_level(log_level::error);
+            } else {
+                throw std::runtime_error{
+                    "Unknown value for --log-level option: {}"_format(optarg)};
+            }
+            break;
+        case 401: // --log-progress=VALUE
+            if (std::strcmp(optarg, "true") == 0) {
+                log_progress = optarg;
+                get_logger().enable_progress();
+            } else if (std::strcmp(optarg, "false") == 0) {
+                log_progress = optarg;
+                get_logger().disable_progress();
+            } else if (std::strcmp(optarg, "auto") == 0) {
+                log_progress = optarg;
+            } else {
+                throw std::runtime_error{
+                    "Unknown value for --log-progress option: {}"_format(
+                        optarg)};
+            }
+            break;
+        case 402: // --log-sql
+            get_logger().enable_sql();
+            break;
+        case 403: // --log-sql-data
+            get_logger().enable_sql_data();
             break;
         case '?':
         default:
@@ -520,7 +653,7 @@ options_t::options_t(int argc, char *argv[]) : options_t()
 
     //they were looking for usage info
     if (long_usage_bool) {
-        long_usage(argv[0], verbose);
+        long_usage(argv[0], help_verbose);
         return;
     }
 
@@ -531,18 +664,20 @@ options_t::options_t(int argc, char *argv[]) : options_t()
 
     //get the input files
     while (optind < argc) {
-        input_files.push_back(std::string(argv[optind]));
-        optind++;
+        input_files.emplace_back(argv[optind]);
+        ++optind;
+    }
+
+    if (!projection) {
+        projection = reprojection::create_projection(PROJ_SPHERE_MERC);
     }
 
     check_options();
 
     if (pass_prompt) {
-        char *prompt = simple_prompt("Password:", 100, 0);
-        if (prompt == nullptr) {
-            database_options.password = boost::none;
-        } else {
-            database_options.password = std::string(prompt);
+        char const *prompt = simple_prompt("Password:", 100, 0);
+        if (prompt != nullptr) {
+            database_options.password = prompt;
         }
     }
 }
@@ -550,76 +685,80 @@ options_t::options_t(int argc, char *argv[]) : options_t()
 void options_t::check_options()
 {
     if (append && create) {
-        throw std::runtime_error("--append and --create options can not be "
-                                 "used at the same time!\n");
+        throw std::runtime_error{"--append and --create options can not be "
+                                 "used at the same time!"};
     }
 
     if (append && !slim) {
-        throw std::runtime_error("--append can only be used with slim mode!\n");
+        throw std::runtime_error{"--append can only be used with slim mode!"};
     }
 
     if (droptemp && !slim) {
-        throw std::runtime_error("--drop only makes sense with --slim.\n");
+        throw std::runtime_error{"--drop only makes sense with --slim."};
     }
 
-    if (hstore_mode == HSTORE_NONE && hstore_columns.size() == 0 &&
+    if (hstore_mode == hstore_column::none && hstore_columns.empty() &&
         hstore_match_only) {
-        fprintf(stderr,
-                "Warning: --hstore-match-only only makes sense with --hstore, "
-                "--hstore-all, or --hstore-column; ignored.\n");
+        log_warn("--hstore-match-only only makes sense with --hstore, "
+                 "--hstore-all, or --hstore-column; ignored.");
         hstore_match_only = false;
     }
 
-    if (enable_hstore_index && hstore_mode == HSTORE_NONE &&
-        hstore_columns.size() == 0) {
-        fprintf(stderr, "Warning: --hstore-add-index only makes sense with "
-                        "hstore enabled.\n");
+    if (enable_hstore_index && hstore_mode == hstore_column::none &&
+        hstore_columns.empty()) {
+        log_warn("--hstore-add-index only makes sense with hstore enabled.");
         enable_hstore_index = false;
     }
 
     if (cache < 0) {
         cache = 0;
-        fprintf(stderr,
-                "WARNING: ram cache cannot be negative. Using 0 instead.\n\n");
+        log_warn("RAM cache cannot be negative. Using 0 instead.");
     }
 
     if (cache == 0) {
         if (!slim) {
-            throw std::runtime_error(
-                "Ram node cache can only be disable in slim mode.\n");
+            throw std::runtime_error{
+                "RAM node cache can only be disable in slim mode."};
         }
         if (!flat_node_cache_enabled) {
-            fprintf(stderr, "WARNING: ram cache is disabled. This will likely "
-                            "slow down processing a lot.\n\n");
+            log_warn("RAM cache is disabled. This will likely slow down "
+                     "processing a lot.");
         }
     }
 
     if (num_procs < 1) {
         num_procs = 1;
-        fprintf(stderr, "WARNING: Must use at least 1 process.\n\n");
+        log_warn("Must use at least 1 process.");
     }
 
     if (sizeof(int *) == 4 && !slim) {
-        fprintf(stderr,
-                "\n!! You are running this on 32bit system, so at most\n");
-        fprintf(stderr,
-                "!! 3GB of RAM can be used. If you encounter unexpected\n");
-        fprintf(
-            stderr,
-            "!! exceptions during import, you should try running in slim\n");
-        fprintf(stderr, "!! mode using parameter -s.\n");
+        log_warn(
+            "This is a 32bit system with not a lot of RAM. Try using --slim.");
     }
 
     // zoom level 31 is the technical limit because we use 32-bit integers for the x and y index of a tile ID
     if (expire_tiles_zoom_min >= 32) {
         expire_tiles_zoom_min = 31;
-        fprintf(stderr, "WARNING: minimum zoom level for tile expiry is too "
-                        "large and has been set to 31.\n\n");
+        log_warn("Minimum zoom level for tile expiry is too "
+                 "large and has been set to 31.");
     }
 
     if (expire_tiles_zoom >= 32) {
         expire_tiles_zoom = 31;
-        fprintf(stderr, "WARNING: maximum zoom level for tile expiry is too "
-                        "large and has been set to 31.\n\n");
+        log_warn("Maximum zoom level for tile expiry is too "
+                 "large and has been set to 31.");
+    }
+
+    if (output_backend == "flex" || output_backend == "gazetteer") {
+        if (style == DEFAULT_STYLE) {
+            throw std::runtime_error{
+                "You have to set the config file with the -S|--style option."};
+        }
+    }
+
+    if (log_progress.empty() && !get_logger().show_progress()) {
+        log_info("Progress logging disabled because you are not logging to the "
+                 "console.");
+        log_info("  Use --log-progress=true to override this.");
     }
 }

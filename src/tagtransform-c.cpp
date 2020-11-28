@@ -5,6 +5,7 @@
 #include "options.hpp"
 #include "taginfo-impl.hpp"
 #include "tagtransform-c.hpp"
+#include "util.hpp"
 #include "wildcmp.hpp"
 
 namespace {
@@ -12,7 +13,7 @@ namespace {
 static const struct
 {
     int offset;
-    const char *highway;
+    char const *highway;
     int roads;
 } layers[] = {{1, "proposed", 0},       {2, "construction", 0},
               {10, "steps", 0},         {10, "cycleway", 0},
@@ -31,16 +32,14 @@ static const struct
               {37, "primary", 1},       {38, "trunk", 1},
               {39, "motorway", 1}};
 
-static const unsigned int nLayers = (sizeof(layers) / sizeof(*layers));
-
 void add_z_order(taglist_t &tags, int *roads)
 {
-    const std::string *layer = tags.get("layer");
-    const std::string *highway = tags.get("highway");
-    bool bridge = tags.get_bool("bridge", false);
-    bool tunnel = tags.get_bool("tunnel", false);
-    const std::string *railway = tags.get("railway");
-    const std::string *boundary = tags.get("boundary");
+    std::string const *const layer = tags.get("layer");
+    std::string const *const highway = tags.get("highway");
+    bool const bridge = tags.get_bool("bridge", false);
+    bool const tunnel = tags.get_bool("tunnel", false);
+    std::string const *const railway = tags.get("railway");
+    std::string const *const boundary = tags.get("boundary");
 
     int z_order = 0;
 
@@ -49,10 +48,10 @@ void add_z_order(taglist_t &tags, int *roads)
     *roads = 0;
 
     if (highway) {
-        for (unsigned i = 0; i < nLayers; i++) {
-            if (!strcmp(layers[i].highway, highway->c_str())) {
-                z_order += layers[i].offset;
-                *roads = layers[i].roads;
+        for (const auto &layer : layers) {
+            if (*highway == layer.highway) {
+                z_order += layer.offset;
+                *roads = layer.roads;
                 break;
             }
         }
@@ -75,9 +74,8 @@ void add_z_order(taglist_t &tags, int *roads)
         z_order -= 100;
     }
 
-    char z[13];
-    snprintf(z, sizeof(z), "%d", z_order);
-    tags.add_tag("z_order", z);
+    util::integer_to_buffer z{z_order};
+    tags.add_tag("z_order", z.c_str());
 }
 
 } // anonymous namespace
@@ -90,7 +88,7 @@ c_tagtransform_t::c_tagtransform_t(options_t const *options,
 std::unique_ptr<tagtransform_t> c_tagtransform_t::clone() const
 {
     return std::unique_ptr<tagtransform_t>(
-        new c_tagtransform_t(m_options, m_export_list));
+        new c_tagtransform_t{m_options, m_export_list});
 }
 
 bool c_tagtransform_t::check_key(std::vector<taginfo> const &infos,
@@ -98,14 +96,12 @@ bool c_tagtransform_t::check_key(std::vector<taginfo> const &infos,
                                  bool strict)
 {
     //go through the actual tags found on the item and keep the ones in the export list
-    size_t i = 0;
-    for (; i < infos.size(); i++) {
-        const taginfo &info = infos[i];
+    for (auto const &info : infos) {
         if (info.flags & FLAG_DELETE) {
             if (wildMatch(info.name.c_str(), k)) {
                 return false;
             }
-        } else if (strcmp(info.name.c_str(), k) == 0) {
+        } else if (std::strcmp(info.name.c_str(), k) == 0) {
             *filter = false;
             *flags |= info.flags;
 
@@ -116,7 +112,7 @@ bool c_tagtransform_t::check_key(std::vector<taginfo> const &infos,
     // if we didn't find any tags that we wanted to export
     // and we aren't strictly adhering to the list
     if (!strict) {
-        if (m_options->hstore_mode != HSTORE_NONE) {
+        if (m_options->hstore_mode != hstore_column::none) {
             /* ... but if hstore_match_only is set then don't take this
                  as a reason for keeping the object */
             if (!m_options->hstore_match_only) {
@@ -124,11 +120,12 @@ bool c_tagtransform_t::check_key(std::vector<taginfo> const &infos,
             }
             /* with hstore, copy all tags... */
             return true;
-        } else if (m_options->hstore_columns.size() > 0) {
+        }
+
+        if (!m_options->hstore_columns.empty()) {
             /* does this column match any of the hstore column prefixes? */
-            size_t j = 0;
-            for (; j < m_options->hstore_columns.size(); ++j) {
-                if (boost::starts_with(k, m_options->hstore_columns[j])) {
+            for (auto const &column : m_options->hstore_columns) {
+                if (boost::starts_with(k, column)) {
                     /* ... but if hstore_match_only is set then don't take this
                          as a reason for keeping the object */
                     if (!m_options->hstore_match_only) {
@@ -156,23 +153,24 @@ bool c_tagtransform_t::filter_tags(osmium::OSMObject const &o, int *polygon,
     if (o.type() == osmium::item_type::relation) {
         export_type = osmium::item_type::way;
     }
-    const std::vector<taginfo> &infos = m_export_list.get(export_type);
+    auto const &infos = m_export_list.get(export_type);
 
     /* We used to only go far enough to determine if it's a polygon or not,
        but now we go through and filter stuff we don't need
        pop each tag off and keep it in the temp list if we like it */
     for (auto const &item : o.tags()) {
-        char const *k = item.key();
-        char const *v = item.value();
+        char const *const k = item.key();
+        char const *const v = item.value();
         //if we want to do more than the export list says
         if (!strict) {
             if (o.type() == osmium::item_type::relation &&
-                strcmp("type", k) == 0) {
+                std::strcmp("type", k) == 0) {
                 out_tags.add_tag(k, v);
                 continue;
             }
             /* Allow named islands to appear as polygons */
-            if (strcmp("natural", k) == 0 && strcmp("coastline", v) == 0) {
+            if (std::strcmp("natural", k) == 0 &&
+                std::strcmp("coastline", v) == 0) {
                 add_area_tag = 1;
 
                 /* Discard natural=coastline tags (we render these from a shapefile instead) */
@@ -219,8 +217,10 @@ bool c_tagtransform_t::filter_rel_member_tags(
     taglist_t &out_tags, bool allow_typeless)
 {
     //if it has a relation figure out what kind it is
-    const std::string *type = rel_tags.get("type");
-    bool is_route = false, is_boundary = false, is_multipolygon = false;
+    std::string const *type = rel_tags.get("type");
+    bool is_route = false;
+    bool is_boundary = false;
+    bool is_multipolygon = false;
     if (type) {
         //what kind of relation is it
         if (*type == "route") {
@@ -238,7 +238,7 @@ bool c_tagtransform_t::filter_rel_member_tags(
     }
 
     /* Clone tags from relation */
-    for (const auto &rel_tag : rel_tags) {
+    for (auto const &rel_tag : rel_tags) {
         //copy the name tag as "route_name"
         if (is_route && (rel_tag.key == "name")) {
             out_tags.add_tag_if_not_exists("route_name", rel_tag.value);
@@ -254,11 +254,11 @@ bool c_tagtransform_t::filter_rel_member_tags(
     }
 
     if (is_route) {
-        const std::string *netw = rel_tags.get("network");
+        std::string const *netw = rel_tags.get("network");
         int networknr = -1;
 
         if (netw != nullptr) {
-            const std::string *state = rel_tags.get("state");
+            std::string const *state = rel_tags.get("state");
             std::string statetype("yes");
             if (state) {
                 if (*state == "alternate") {
@@ -288,7 +288,7 @@ bool c_tagtransform_t::filter_rel_member_tags(
             }
         }
 
-        const std::string *prefcol = rel_tags.get("preferred_color");
+        std::string const *prefcol = rel_tags.get("preferred_color");
         if (prefcol != nullptr && prefcol->size() == 1) {
             if ((*prefcol)[0] == '0' || (*prefcol)[0] == '1' ||
                 (*prefcol)[0] == '2' || (*prefcol)[0] == '3' ||
@@ -301,7 +301,7 @@ bool c_tagtransform_t::filter_rel_member_tags(
             out_tags.add_tag_if_not_exists("route_pref_color", "0");
         }
 
-        const std::string *relref = rel_tags.get("ref");
+        std::string const *relref = rel_tags.get("ref");
         if (relref != nullptr) {
             if (networknr == 10) {
                 out_tags.add_tag_if_not_exists("lcn_ref", *relref);

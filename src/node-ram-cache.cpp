@@ -4,6 +4,7 @@
 */
 
 #include "format.hpp"
+#include "logging.hpp"
 #include "node-ram-cache.hpp"
 #include "osmtypes.hpp"
 #include "util.hpp"
@@ -15,9 +16,9 @@
 
 /* Here we use a similar storage structure as middle-ram, except we allow
  * the array to be lossy so we can cap the total memory usage. Hence it is a
- * combination of a sparse array with a priority queue
+ * combination of a sparse array with a priority queue.
  *
- * Like middle-ram we have a number of blocks all storing PER_BLOCK
+ * Like middle-ram we have a number of blocks all storing per_block()
  * ramNodes. However, here we also track the number of nodes in each block.
  * Seperately we have a priority queue like structure when maintains a list
  * of all the used block so we can easily find the block with the least
@@ -50,39 +51,14 @@
  *  Reuse old block: O(log maxBlocks)
  */
 
-#define BLOCK_SHIFT 13
-#define PER_BLOCK (((osmid_t)1) << BLOCK_SHIFT)
-#define NUM_BLOCKS (((osmid_t)1) << (36 - BLOCK_SHIFT))
-
-#define SAFETY_MARGIN (1024 * PER_BLOCK * sizeof(osmium::Location))
-
-static int32_t id2block(osmid_t id)
-{
-    /* + NUM_BLOCKS/2 allows for negative IDs */
-    return (id >> BLOCK_SHIFT) + NUM_BLOCKS / 2;
-}
-
-static int id2offset(osmid_t id) { return id & (PER_BLOCK - 1); }
-
-static osmid_t block2id(int32_t block, int offset)
-{
-    return (((osmid_t)block - NUM_BLOCKS / 2) << BLOCK_SHIFT) + (osmid_t)offset;
-}
-
-#define Swap(a, b)                                                             \
-    {                                                                          \
-        ramNodeBlock *__tmp = a;                                               \
-        a = b;                                                                 \
-        b = __tmp;                                                             \
-    }
-
 void node_ram_cache::percolate_up(int pos)
 {
-    int i = pos;
-    while (i > 0) {
-        int parent = (i - 1) >> 1;
-        if (queue[i]->used() < queue[parent]->used()) {
-            Swap(queue[i], queue[parent]) i = parent;
+    while (pos > 0) {
+        int const parent = (pos - 1) >> 1U;
+        if (queue[pos]->used() < queue[parent]->used()) {
+            using std::swap;
+            swap(queue[pos], queue[parent]);
+            pos = parent;
         } else {
             break;
         }
@@ -91,18 +67,21 @@ void node_ram_cache::percolate_up(int pos)
 
 osmium::Location *node_ram_cache::next_chunk()
 {
+    constexpr auto const safety_margin =
+        1024 * per_block() * sizeof(osmium::Location);
+
     if ((allocStrategy & ALLOC_DENSE_CHUNK) == 0) {
         // allocate starting from the upper end of the block cache
-        blockCachePos += PER_BLOCK * sizeof(osmium::Location);
-        char *result = blockCache + cacheSize - blockCachePos + SAFETY_MARGIN;
+        blockCachePos += per_block() * sizeof(osmium::Location);
+        char *result = blockCache + cacheSize - blockCachePos + safety_margin;
 
-        return new (result) osmium::Location[PER_BLOCK];
-    } else {
-        return new osmium::Location[PER_BLOCK];
+        return new (result) osmium::Location[per_block()];
     }
+
+    return new osmium::Location[per_block()];
 }
 
-void node_ram_cache::set_sparse(osmid_t id, const osmium::Location &coord)
+void node_ram_cache::set_sparse(osmid_t id, osmium::Location location)
 {
     // Sparse cache depends on ordered nodes, reject out-of-order ids.
     // Also check that there is still space.
@@ -112,31 +91,29 @@ void node_ram_cache::set_sparse(osmid_t id, const osmium::Location &coord)
             return;
         } else {
             if (maxSparseId && id < maxSparseId) {
-                fprintf(stderr,
-                        "Node ids are out of order. Please use slim mode.\n");
-            } else {
-                fprintf(
-                    stderr,
-                    "\nNode cache size is too small to fit all nodes. Please "
-                    "increase cache size\n");
+                throw std::runtime_error{
+                    "Node ids are out of order. Please use slim mode."};
             }
-            throw std::runtime_error("Using RAM cache.");
+            throw std::runtime_error{
+                "Node cache size is too small to fit all nodes. Please "
+                "increase cache size."};
         }
     }
     maxSparseId = id;
     sparseBlock[sizeSparseTuples].id = id;
-    sparseBlock[sizeSparseTuples].coord = coord;
+    sparseBlock[sizeSparseTuples].coord = location;
 
-    sizeSparseTuples++;
+    ++sizeSparseTuples;
     cacheUsed += sizeof(ramNodeID);
-    storedNodes++;
+    ++storedNodes;
 }
 
-void node_ram_cache::set_dense(osmid_t id, const osmium::Location &coord)
+void node_ram_cache::set_dense(osmid_t id, osmium::Location location)
 {
     int32_t const block = id2block(id);
-    assert(block <
-           NUM_BLOCKS); // https://github.com/openstreetmap/osm2pgsql/issues/965
+    assert(
+        block <
+        num_blocks()); // https://github.com/openstreetmap/osm2pgsql/issues/965
     int const offset = id2offset(id);
 
     if (maxBlocks == 0) {
@@ -147,32 +124,32 @@ void node_ram_cache::set_dense(osmid_t id, const osmium::Location &coord)
         if (((allocStrategy & ALLOC_SPARSE) > 0) && (usedBlocks < maxBlocks) &&
             (cacheUsed > cacheSize)) {
             /* TODO: It is more memory efficient to drop nodes from the sparse node
-       * cache than from the dense node cache */
+             * cache than from the dense node cache */
         }
         if ((usedBlocks < maxBlocks) && (cacheUsed < cacheSize)) {
             /* if usedBlocks > 0 then the previous block is used up. Need to correctly
-       * handle it. */
+             * handle it. */
             if (usedBlocks > 0) {
                 /* If sparse allocation is also set, then check if the previous block
-         * has sufficient density
-         * to store it in dense representation. If not, push all elements of the
-         * block
-         * to the sparse node cache and reuse memory of the previous block for
-         * the current block */
+                 * has sufficient density
+                 * to store it in dense representation. If not, push all elements of the
+                 * block
+                 * to the sparse node cache and reuse memory of the previous block for
+                 * the current block */
                 if (((allocStrategy & ALLOC_SPARSE) == 0) ||
                     ((queue[usedBlocks - 1]->used() /
                       (double)(1 << BLOCK_SHIFT)) >
                      (sizeof(osmium::Location) / (double)sizeof(ramNodeID)))) {
                     /* Block has reached the level to keep it in dense representation */
                     /* We've just finished with the previous block, so we need to
-           * percolate it up the queue to its correct position */
+                     * percolate it up the queue to its correct position */
                     /* Upto log(usedBlocks) iterations */
                     percolate_up(usedBlocks - 1);
                     blocks[block].nodes = next_chunk();
                 } else {
                     /* previous block was not dense enough, so push it into the sparse
-           * node cache instead */
-                    for (int i = 0; i < (1 << BLOCK_SHIFT); i++) {
+                     * node cache instead */
+                    for (int i = 0; i < (1 << BLOCK_SHIFT); ++i) {
                         if (queue[usedBlocks - 1]->nodes[i].valid()) {
                             set_sparse(
                                 block2id(queue[usedBlocks - 1]->block_offset,
@@ -180,16 +157,16 @@ void node_ram_cache::set_dense(osmid_t id, const osmium::Location &coord)
                                 queue[usedBlocks - 1]->nodes[i]);
                             // invalidate location
                             queue[usedBlocks - 1]->nodes[i] =
-                                osmium::Location();
+                                osmium::Location{};
                         }
                     }
                     /* reuse previous block, as its content is now in the sparse
-           * representation */
+                     * representation */
                     storedNodes -= queue[usedBlocks - 1]->used();
                     blocks[block].nodes = queue[usedBlocks - 1]->nodes;
                     blocks[queue[usedBlocks - 1]->block_offset].nodes = nullptr;
                     usedBlocks--;
-                    cacheUsed -= PER_BLOCK * sizeof(osmium::Location);
+                    cacheUsed -= per_block() * sizeof(osmium::Location);
                 }
             } else {
                 blocks[block].nodes = next_chunk();
@@ -198,42 +175,42 @@ void node_ram_cache::set_dense(osmid_t id, const osmium::Location &coord)
             blocks[block].reset_used();
             blocks[block].block_offset = block;
             if (!blocks[block].nodes) {
-                fprintf(stderr, "Error allocating nodes\n");
-                util::exit_nicely();
+                throw std::runtime_error{"Error allocating nodes."};
             }
             queue[usedBlocks] = &blocks[block];
-            usedBlocks++;
-            cacheUsed += PER_BLOCK * sizeof(osmium::Location);
+            ++usedBlocks;
+            cacheUsed += per_block() * sizeof(osmium::Location);
 
             /* If we've just used up the last possible block we enter the
-       * transition and we change the invariant. To do this we percolate
-       * the newly allocated block straight to the head */
+             * transition and we change the invariant. To do this we percolate
+             * the newly allocated block straight to the head */
             if ((usedBlocks == maxBlocks) || (cacheUsed > cacheSize)) {
                 percolate_up(usedBlocks - 1);
             }
         } else {
             if ((allocStrategy & ALLOC_LOSSY) == 0) {
-                fprintf(stderr,
-                        "\nNode cache size is too small to fit all nodes. "
-                        "Please increase cache size\n");
-                util::exit_nicely();
+                throw std::runtime_error{
+                    "Node cache size is too small to fit all nodes. "
+                    "Please increase cache size."};
             }
             /* We've reached the maximum number of blocks, so now we push the
-       * current head of the tree down to the right level to restore the
-       * priority queue invariant. Upto log(maxBlocks) iterations */
+             * current head of the tree down to the right level to restore the
+             * priority queue invariant. Upto log(maxBlocks) iterations */
 
             int i = 0;
             while (2 * i + 1 < usedBlocks - 1) {
                 if (queue[2 * i + 1]->used() <= queue[2 * i + 2]->used()) {
                     if (queue[i]->used() > queue[2 * i + 1]->used()) {
-                        Swap(queue[i], queue[2 * i + 1]);
+                        using std::swap;
+                        swap(queue[i], queue[2 * i + 1]);
                         i = 2 * i + 1;
                     } else {
                         break;
                     }
                 } else {
                     if (queue[i]->used() > queue[2 * i + 2]->used()) {
-                        Swap(queue[i], queue[2 * i + 2]);
+                        using std::swap;
+                        swap(queue[i], queue[2 * i + 2]);
                         i = 2 * i + 2;
                     } else {
                         break;
@@ -241,10 +218,10 @@ void node_ram_cache::set_dense(osmid_t id, const osmium::Location &coord)
                 }
             }
             /* Now the head of the queue is the smallest, so it becomes our
-       * replacement candidate */
+             * replacement candidate */
             blocks[block].nodes = queue[0]->nodes;
             blocks[block].reset_used();
-            new (blocks[block].nodes) osmium::Location[PER_BLOCK];
+            new (blocks[block].nodes) osmium::Location[per_block()];
 
             /* Clear old head block and point to new block */
             storedNodes -= queue[0]->used();
@@ -254,34 +231,33 @@ void node_ram_cache::set_dense(osmid_t id, const osmium::Location &coord)
         }
     } else {
         /* Insert into an existing block. We can't allow this in general or it
-     * will break the invariant. However, it will work fine if all the
-     * nodes come in numerical order, which is the common case */
+         * will break the invariant. However, it will work fine if all the
+         * nodes come in numerical order, which is the common case */
 
-        int expectedpos;
+        int expectedpos = 0;
         if ((usedBlocks < maxBlocks) && (cacheUsed < cacheSize)) {
             expectedpos = usedBlocks - 1;
-        } else {
-            expectedpos = 0;
         }
 
         if (queue[expectedpos] != &blocks[block]) {
-            if (!warn_node_order) {
-                fprintf(stderr,
-                        "WARNING: Found Out of order node %" PRIdOSMID
-                        " (%d,%d) - this will impact the cache efficiency\n",
-                        id, block, offset);
-                warn_node_order++;
+            if (m_warn_node_order) {
+                log_warn("Found out of order node {}"
+                         " ({},{}) - this will impact the cache efficiency",
+                         id, block, offset);
+
+                // Only warn once
+                m_warn_node_order = false;
             }
             return;
         }
     }
 
-    blocks[block].nodes[offset] = coord;
+    blocks[block].nodes[offset] = location;
     blocks[block].inc_used();
-    storedNodes++;
+    ++storedNodes;
 }
 
-osmium::Location node_ram_cache::get_sparse(osmid_t id)
+osmium::Location node_ram_cache::get_sparse(osmid_t id) const
 {
     int64_t pivotPos = sizeSparseTuples >> 1;
     int64_t minPos = 0;
@@ -292,31 +268,30 @@ osmium::Location node_ram_cache::get_sparse(osmid_t id)
             return sparseBlock[pivotPos].coord;
         }
         if ((pivotPos == minPos) || (pivotPos == maxPos)) {
-            return osmium::Location();
+            return osmium::Location{};
         }
 
         if (sparseBlock[pivotPos].id > id) {
             maxPos = pivotPos;
-            pivotPos = minPos + ((maxPos - minPos) >> 1);
+            pivotPos = minPos + ((maxPos - minPos) >> 1U);
         } else {
             minPos = pivotPos;
-            pivotPos = minPos + ((maxPos - minPos) >> 1);
+            pivotPos = minPos + ((maxPos - minPos) >> 1U);
         }
     }
 
-    return osmium::Location();
+    return osmium::Location{};
 }
 
-osmium::Location node_ram_cache::get_dense(osmid_t id)
+osmium::Location node_ram_cache::get_dense(osmid_t id) const
 {
-    const int32_t block = id2block(id);
-    const int offset = id2offset(id);
+    auto const block = id2block(id);
 
     if (!blocks[block].nodes) {
-        return osmium::Location();
+        return osmium::Location{};
     }
 
-    return blocks[block].nodes[offset];
+    return blocks[block].nodes[id2offset(id)];
 }
 
 node_ram_cache::node_ram_cache(int strategy, int cacheSizeMB)
@@ -327,72 +302,64 @@ node_ram_cache::node_ram_cache(int strategy, int cacheSizeMB)
     }
 
     /* How much we can fit, and make sure it's odd */
-    maxBlocks = (cacheSize / (PER_BLOCK * sizeof(osmium::Location)));
+    maxBlocks = (cacheSize / (per_block() * sizeof(osmium::Location)));
     maxSparseTuples = (cacheSize / sizeof(ramNodeID)) + 1;
 
     if ((allocStrategy & ALLOC_DENSE) > 0) {
-        fprintf(stderr, "Allocating memory for dense node cache\n");
-        blocks = (ramNodeBlock *)calloc(NUM_BLOCKS, sizeof(ramNodeBlock));
+        log_info("Allocating memory for dense node cache");
+        blocks = (ramNodeBlock *)calloc(num_blocks(), sizeof(ramNodeBlock));
         if (!blocks) {
-            fprintf(stderr,
-                    "Out of memory for node cache dense index, try using "
-                    "\"--cache-strategy sparse\" instead \n");
-            util::exit_nicely();
+            throw std::runtime_error{
+                "Out of memory for node cache dense index, try using "
+                "\"--cache-strategy sparse\" instead."};
         }
         queue = (ramNodeBlock **)calloc(maxBlocks, sizeof(ramNodeBlock *));
         /* Use this method of allocation if virtual memory is limited,
-     * or if OS allocs physical memory right away, rather than page by page
-     * once it is needed.
-     */
+         * or if OS allocs physical memory right away, rather than page by page
+         * once it is needed.
+         */
         if ((allocStrategy & ALLOC_DENSE_CHUNK) > 0) {
-            fprintf(stderr,
-                    "Allocating dense node cache in block sized chunks\n");
+            log_info("Allocating dense node cache in block sized chunks");
             if (!queue) {
-                fprintf(stderr, "Out of memory, reduce --cache size\n");
-                util::exit_nicely();
+                throw std::runtime_error{"Out of memory, reduce --cache size."};
             }
         } else {
-            fprintf(stderr, "Allocating dense node cache in one big chunk\n");
-            blockCache = (char *)malloc((maxBlocks + 1024) * PER_BLOCK *
+            log_info("Allocating dense node cache in one big chunk");
+            blockCache = (char *)malloc((maxBlocks + 1024) * per_block() *
                                         sizeof(osmium::Location));
             if (!queue || !blockCache) {
-                fprintf(stderr, "Out of memory for dense node cache, reduce "
-                                "--cache size\n");
-                util::exit_nicely();
+                throw std::runtime_error{
+                    "Out of memory for dense node cache, reduce --cache size."};
             }
         }
     }
 
     /* Allocate the full amount of memory given by --cache parameter in one go.
-   * If both dense and sparse cache alloc is set, this will allocate up to twice
-   * as much virtual memory as specified by --cache. This relies on the OS doing
-   * lazy allocation of physical RAM. Extra accounting during setting of nodes
-   * is done
-   * to ensure physical RAM usage should roughly be no more than --cache
-   */
+     * If both dense and sparse cache alloc is set, this will allocate up to twice
+     * as much virtual memory as specified by --cache. This relies on the OS doing
+     * lazy allocation of physical RAM. Extra accounting during setting of nodes
+     * is done
+     * to ensure physical RAM usage should roughly be no more than --cache
+     */
 
     if ((allocStrategy & ALLOC_SPARSE) > 0) {
-        fprintf(stderr, "Allocating memory for sparse node cache\n");
+        log_info("Allocating memory for sparse node cache");
         if (!blockCache) {
             sparseBlock =
                 (ramNodeID *)malloc(maxSparseTuples * sizeof(ramNodeID));
         } else {
-            fprintf(stderr, "Sharing dense sparse\n");
+            log_info("Sharing dense sparse");
             sparseBlock = (ramNodeID *)blockCache;
         }
         if (!sparseBlock) {
-            fprintf(
-                stderr,
-                "Out of memory for sparse node cache, reduce --cache size\n");
-            util::exit_nicely();
+            throw std::runtime_error{
+                "Out of memory for sparse node cache, reduce --cache size."};
         }
     }
 
-    fprintf(stderr,
-            "Node-cache: cache=%" PRId64 "MB, maxblocks=%d*%" PRId64
-            ", allocation method=%i\n",
-            (cacheSize >> 20), maxBlocks,
-            (int64_t)PER_BLOCK * sizeof(osmium::Location), allocStrategy);
+    log_info("Node-cache: cache={}MB, maxblocks={}*{}, allocation method={}",
+             (cacheSize >> 20U), maxBlocks,
+             per_block() * sizeof(osmium::Location), allocStrategy);
 }
 
 node_ram_cache::~node_ram_cache()
@@ -401,11 +368,10 @@ node_ram_cache::~node_ram_cache()
         return;
     }
 
-    fprintf(
-        stderr,
-        "node cache: stored: %" PRIdOSMID
-        "(%.2f%%), storage efficiency: %.2f%% (dense blocks: %i, "
-        "sparse nodes: %" PRId64 "), hit rate: %.2f%%\n",
+    log_info(
+        "node cache: stored: {}"
+        "({:.2f}%), storage efficiency: {:.2f}% (dense blocks: {}, "
+        "sparse nodes: {}), hit rate: {:.2f}%",
         storedNodes, totalNodes == 0 ? 0.0f : 100.0f * storedNodes / totalNodes,
         cacheUsed == 0
             ? 0.0f
@@ -433,34 +399,31 @@ node_ram_cache::~node_ram_cache()
     }
 }
 
-void node_ram_cache::set(osmid_t id, const osmium::Location &coord)
+void node_ram_cache::set(osmid_t id, osmium::Location location)
 {
     if (cacheSize == 0) {
         return;
     }
 
-    if ((id > 0 && id >> BLOCK_SHIFT >> 32) ||
-        (id < 0 && ~id >> BLOCK_SHIFT >> 32)) {
-        fprintf(stderr,
-                "\nAbsolute node IDs must not be larger than %" PRId64
-                " (got%" PRId64 " )\n",
-                (int64_t)1 << 42, (int64_t)id);
-        util::exit_nicely();
+    if ((id > 0 && id >> BLOCK_SHIFT >> 32U) ||
+        (id < 0 && ~id >> BLOCK_SHIFT >> 32U)) {
+        throw std::runtime_error{"Absolute node IDs must not be larger than {}"
+                                 " (got {})."_format(1ULL << 42U, id)};
     }
-    totalNodes++;
+    ++totalNodes;
     /* if ALLOC_DENSE and ALLOC_SPARSE are set, send it through
-   * ram_nodes_set_dense. If a block is non dense, it will automatically
-   * get pushed to the sparse cache if a block is sparse and ALLOC_SPARSE is set
-   */
-    if ((allocStrategy & ALLOC_DENSE) > 0) {
-        set_dense(id, coord);
-    } else if ((allocStrategy & ALLOC_SPARSE) > 0) {
-        set_sparse(id, coord);
+     * ram_nodes_set_dense. If a block is non dense, it will automatically
+     * get pushed to the sparse cache if a block is sparse and ALLOC_SPARSE is set
+     */
+    if ((allocStrategy & ALLOC_DENSE) != 0) {
+        set_dense(id, location);
+    } else if ((allocStrategy & ALLOC_SPARSE) != 0) {
+        set_sparse(id, location);
     } else {
         // Command line options always have ALLOC_DENSE | ALLOC_SPARSE
         throw std::logic_error{
             "Unexpected cache strategy in node_ram_cache::set with "
-            "allocStrategy {}"_format(allocStrategy)};
+            "allocStrategy {}."_format(allocStrategy)};
     }
 }
 

@@ -11,32 +11,35 @@
 #include <vector>
 
 #include "osmtypes.hpp"
-
-class pg_conn_t;
+#include "pgsql.hpp"
 
 /**
  * Table information necessary for building SQL queries.
  */
 struct db_target_descr_t
 {
+    /// Schema of the target table (can be empty for default schema)
+    std::string schema;
     /// Name of the target table for the copy operation.
     std::string name;
-    /// Comma-separated list of rows for copy operation (when empty: all rows)
-    std::string rows;
     /// Name of id column used when deleting objects.
     std::string id;
+    /// Comma-separated list of rows for copy operation (when empty: all rows)
+    std::string rows;
 
     /**
      * Check if the buffer would use exactly the same copy operation.
      */
     bool same_copy_target(db_target_descr_t const &other) const noexcept
     {
-        return (this == &other) || (name == other.name && rows == other.rows);
+        return (this == &other) || (schema == other.schema &&
+                                    name == other.name && rows == other.rows);
     }
 
     db_target_descr_t() = default;
-    db_target_descr_t(char const *n, char const *i, char const *r = "")
-    : name(n), rows(r), id(i)
+
+    db_target_descr_t(std::string n, std::string i, std::string r = {})
+    : name(std::move(n)), id(std::move(i)), rows(std::move(r))
     {}
 };
 
@@ -65,6 +68,48 @@ public:
 private:
     /// Vector with object to delete before copying
     std::vector<osmid_t> m_deletables;
+};
+
+/**
+ * Deleter which removes objects by (optional) type and id from the database.
+ */
+class db_deleter_by_type_and_id_t
+{
+    enum
+    {
+        // There is a trade-off here between sending as few DELETE SQL as
+        // possible and keeping the size of the deletable vector managable.
+        Max_entries = 1000000
+    };
+
+    struct item_t
+    {
+        osmid_t osm_id;
+        char osm_type;
+
+        item_t(char t, osmid_t i) : osm_id(i), osm_type(t) {}
+    };
+
+public:
+    bool has_data() const noexcept { return !m_deletables.empty(); }
+
+    void add(char type, osmid_t osm_id)
+    {
+        m_deletables.emplace_back(type, osm_id);
+        if (type != 'X') {
+            m_has_type = true;
+        }
+    }
+
+    void delete_rows(std::string const &table, std::string const &column,
+                     pg_conn_t *conn);
+
+    bool is_full() const noexcept { return m_deletables.size() > Max_entries; }
+
+private:
+    /// Vector with object to delete before copying
+    std::vector<item_t> m_deletables;
+    bool m_has_type = false;
 };
 
 /**
@@ -143,7 +188,8 @@ public:
     void delete_data(pg_conn_t *conn) override
     {
         if (m_deleter.has_data()) {
-            m_deleter.delete_rows(target->name, target->id, conn);
+            m_deleter.delete_rows(qualified_name(target->schema, target->name),
+                                  target->id, conn);
         }
     }
 
@@ -178,13 +224,13 @@ struct db_cmd_finish_t : public db_cmd_t
 class db_copy_thread_t
 {
 public:
-    db_copy_thread_t(std::string const &conninfo);
+    explicit db_copy_thread_t(std::string const &conninfo);
 
     db_copy_thread_t(db_copy_thread_t const &) = delete;
     db_copy_thread_t &operator=(db_copy_thread_t const &) = delete;
 
-    db_copy_thread_t(db_copy_thread_t &&) = default;
-    db_copy_thread_t &operator=(db_copy_thread_t &&) = default;
+    db_copy_thread_t(db_copy_thread_t &&) = delete;
+    db_copy_thread_t &operator=(db_copy_thread_t &&) = delete;
 
     ~db_copy_thread_t();
 

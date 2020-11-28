@@ -2,7 +2,6 @@
 #define OSM2PGSQL_OUTPUT_GAZETTEER_HPP
 
 #include <memory>
-#include <string>
 
 #include <osmium/memory/buffer.hpp>
 
@@ -11,7 +10,6 @@
 #include "osmium-builder.hpp"
 #include "osmtypes.hpp"
 #include "output.hpp"
-#include "util.hpp"
 
 class output_gazetteer_t : public output_t
 {
@@ -19,8 +17,8 @@ class output_gazetteer_t : public output_t
                        std::shared_ptr<middle_query_t> const &cloned_mid,
                        std::shared_ptr<db_copy_thread_t> const &copy_thread)
     : output_t(cloned_mid, other->m_options), m_copy(copy_thread),
-      m_builder(other->m_options.projection, true),
-      osmium_buffer(PLACE_BUFFER_SIZE, osmium::memory::Buffer::auto_grow::yes)
+      m_builder(other->m_options.projection),
+      m_osmium_buffer(PLACE_BUFFER_SIZE, osmium::memory::Buffer::auto_grow::yes)
     {}
 
 public:
@@ -28,8 +26,8 @@ public:
                        options_t const &options,
                        std::shared_ptr<db_copy_thread_t> const &copy_thread)
     : output_t(mid, options), m_copy(copy_thread),
-      m_builder(options.projection, true),
-      osmium_buffer(PLACE_BUFFER_SIZE, osmium::memory::Buffer::auto_grow::yes)
+      m_builder(options.projection),
+      m_osmium_buffer(PLACE_BUFFER_SIZE, osmium::memory::Buffer::auto_grow::yes)
     {
         m_style.load_style(options.style);
     }
@@ -39,20 +37,15 @@ public:
           std::shared_ptr<db_copy_thread_t> const &copy_thread) const override
     {
         return std::shared_ptr<output_t>(
-            new output_gazetteer_t(this, mid, copy_thread));
+            new output_gazetteer_t{this, mid, copy_thread});
     }
 
     void start() override;
-    void stop(osmium::thread::Pool *) override {}
-    void commit() override;
+    void stop(thread_pool_t *) noexcept override {}
+    void sync() override;
 
-    void enqueue_ways(pending_queue_t &, osmid_t, size_t, size_t &) override {}
-    void pending_way(osmid_t, int) override {}
-
-    void enqueue_relations(pending_queue_t &, osmid_t, size_t,
-                           size_t &) override
-    {}
-    void pending_relation(osmid_t, int) override {}
+    void pending_way(osmid_t) noexcept override {}
+    void pending_relation(osmid_t) noexcept override {}
 
     void node_add(osmium::Node const &node) override;
     void way_add(osmium::Way *way) override;
@@ -84,7 +77,7 @@ private:
     gazetteer_style_t m_style;
 
     geom::osmium_builder_t m_builder;
-    osmium::memory::Buffer osmium_buffer;
+    osmium::memory::Buffer m_osmium_buffer;
 };
 
 #endif // OSM2PGSQL_OUTPUT_GAZETTEER_HPP

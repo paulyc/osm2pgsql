@@ -16,34 +16,45 @@ namespace geom {
 class osmium_builder_t
 {
 public:
-    typedef std::string wkb_t;
-    typedef std::vector<std::string> wkbs_t;
+    using wkb_t = std::string;
+    using wkbs_t = std::vector<std::string>;
 
-    explicit osmium_builder_t(std::shared_ptr<reprojection> const &proj,
-                              bool build_multigeoms)
+    explicit osmium_builder_t(std::shared_ptr<reprojection> const &proj)
     : m_proj(proj), m_buffer(1024, osmium::memory::Buffer::auto_grow::yes),
-      m_writer(m_proj->target_srs()), m_build_multigeoms(build_multigeoms)
+      m_writer(m_proj->target_srs())
     {}
 
     wkb_t get_wkb_node(osmium::Location const &loc) const;
-    wkbs_t get_wkb_line(osmium::WayNodeList const &way, double split_at);
+    wkbs_t get_wkb_line(osmium::WayNodeList const &nodes, double split_at);
     wkb_t get_wkb_polygon(osmium::Way const &way);
 
     wkbs_t get_wkb_multipolygon(osmium::Relation const &rel,
-                                osmium::memory::Buffer const &ways);
+                                osmium::memory::Buffer const &ways,
+                                bool build_multigeoms, bool wrap_multi = false);
+
     wkbs_t get_wkb_multiline(osmium::memory::Buffer const &ways,
                              double split_at);
 
+    /**
+     * Wrap the geometries (must be one or more polygons) in the parameter
+     * into a single multipolygon which is returned in-place in geometries.
+     */
+    void wrap_in_multipolygon(wkbs_t *geometries);
+
+    /**
+     * Wrap the polygon geometry in the parameter into a multipolygon which
+     * is returned in-place in geometry.
+     */
+    void wrap_in_multipolygon(wkb_t *geometry);
+
 private:
-    wkb_t create_multipolygon(osmium::Area const &area);
     wkbs_t create_polygons(osmium::Area const &area);
-    size_t add_mp_points(const osmium::NodeRefList &nodes);
+    size_t add_mp_points(osmium::NodeRefList const &nodes);
 
     std::shared_ptr<reprojection> m_proj;
     // internal buffer for creating areas
     osmium::memory::Buffer m_buffer;
     ewkb::writer_t m_writer;
-    bool m_build_multigeoms;
 };
 
 } // namespace geom

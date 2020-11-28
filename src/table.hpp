@@ -12,29 +12,27 @@
 #include <utility>
 #include <vector>
 
-#include <boost/optional.hpp>
-
-typedef std::vector<std::string> hstores_t;
+using hstores_t = std::vector<std::string>;
 
 class table_t
 {
 public:
     table_t(std::string const &name, std::string const &type,
-            columns_t const &columns, hstores_t const &hstore_columns,
-            const int srid, const bool append, const int hstore_mode,
-            std::shared_ptr<db_copy_thread_t> const &copy_thread);
-    table_t(const table_t &other,
+            columns_t const &columns, hstores_t const &hstore_columns, int srid,
+            bool append, hstore_column hstore_mode,
+            std::shared_ptr<db_copy_thread_t> const &copy_thread,
+            std::string const &schema);
+    table_t(table_t const &other,
             std::shared_ptr<db_copy_thread_t> const &copy_thread);
 
-    void start(std::string const &conninfo,
-               boost::optional<std::string> const &table_space);
+    void start(std::string const &conninfo, std::string const &table_space);
     void stop(bool updateable, bool enable_hstore_index,
-              boost::optional<std::string> const &table_space_index);
+              std::string const &table_space_index);
 
-    void commit();
+    void sync();
 
     void write_row(osmid_t id, taglist_t const &tags, std::string const &geom);
-    void delete_row(const osmid_t id);
+    void delete_row(osmid_t id);
 
     // interface for retrieving well known binary geometry from the table
     class wkb_reader
@@ -42,7 +40,7 @@ public:
         friend table_t;
 
     public:
-        const char *get_next()
+        char const *get_next()
         {
             if (m_current < m_count) {
                 return m_result.get_value(m_current++, 0);
@@ -50,10 +48,10 @@ public:
             return nullptr;
         }
 
-        int get_count() const { return m_count; }
+        int get_count() const noexcept { return m_count; }
 
     private:
-        wkb_reader(pg_result_t &&result)
+        explicit wkb_reader(pg_result_t &&result)
         : m_result(std::move(result)), m_count(m_result.num_tuples()),
           m_current(0)
         {}
@@ -62,7 +60,7 @@ public:
         int m_count;
         int m_current;
     };
-    wkb_reader get_wkb_reader(const osmid_t id);
+    wkb_reader get_wkb_reader(osmid_t id);
 
 protected:
     void connect();
@@ -80,13 +78,13 @@ protected:
 
     std::string m_conninfo;
     std::shared_ptr<db_target_descr_t> m_target;
-    std::string type;
+    std::string m_type;
     std::unique_ptr<pg_conn_t> m_sql_conn;
-    std::string srid;
-    bool append;
-    int hstore_mode;
-    columns_t columns;
-    hstores_t hstore_columns;
+    std::string m_srid;
+    bool m_append;
+    hstore_column m_hstore_mode;
+    columns_t m_columns;
+    hstores_t m_hstore_columns;
     std::string m_table_space;
 
     db_copy_mgr_t<db_deleter_by_id_t> m_copy;

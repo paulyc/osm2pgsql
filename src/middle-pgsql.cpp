@@ -13,16 +13,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <ctime>
 #include <functional>
 
 #include <osmium/builder/osm_object_builder.hpp>
 #include <osmium/memory/buffer.hpp>
 #include <osmium/osm/types_from_string.hpp>
 
-#include <libpq-fe.h>
-
 #include "format.hpp"
+#include "logging.hpp"
 #include "middle-pgsql.hpp"
 #include "node-persistent-cache.hpp"
 #include "node-ram-cache.hpp"
@@ -32,133 +30,54 @@
 #include "util.hpp"
 
 /**
- * Helper to create SQL queries.
+ * Iterate over the result from a pgsql query and call the func with all
+ * the ids from the first column.
  *
- * The input string is mangled as follows:
- * %p replaced by the content of the "prefix" option
- * %i replaced by the content of the "tblsslim_data" option
- * %t replaced by the content of the "tblssslim_index" option
- * %m replaced by "UNLOGGED" if the "droptemp" option is set
- * other occurrences of the "%" char are treated normally.
- * any occurrence of { or } will be ignored (not copied to output string);
- * anything inside {} is only copied if it contained at least one of
- * %p, %i, %t, %m that was not NULL.
- *
- * So, the input string
- *    Hello{ dear %i}!
- * will, if i is set to "John", translate to
- *    Hello dear John!
- * but if i is unset, translate to
- *    Hello!
- *
- * This is used for constructing SQL queries with proper tablespace settings.
+ * \param result The result to iterate over.
+ * \param func Lambda taking an osmid_t as only parameter.
  */
-static void set_prefix_and_tbls(options_t const *options, std::string *string)
+template <typename FUNC>
+void for_each_id(pg_result_t const &result, FUNC &&func)
 {
-    if (string->empty()) {
-        return;
+    for (int i = 0; i < result.num_tuples(); ++i) {
+        auto const id = osmium::string_to_object_id(result.get_value(i, 0));
+        std::forward<FUNC>(func)(id);
     }
-
-    char buffer[1024];
-    char *openbrace = nullptr;
-    bool copied = false;
-    char const *source = string->c_str();
-    char *dest = buffer;
-
-    while (*source) {
-        if (*source == '{') {
-            openbrace = dest;
-            copied = false;
-            source++;
-            continue;
-        } else if (*source == '}') {
-            if (!copied && openbrace) {
-                dest = openbrace;
-            }
-            source++;
-            continue;
-        } else if (*source == '%') {
-            if (*(source + 1) == 'p') {
-                if (!options->prefix.empty()) {
-                    strcpy(dest, options->prefix.c_str());
-                    dest += strlen(options->prefix.c_str());
-                    copied = true;
-                }
-                source += 2;
-                continue;
-            } else if (*(source + 1) == 't') {
-                if (options->tblsslim_data) {
-                    strcpy(dest, options->tblsslim_data->c_str());
-                    dest += strlen(options->tblsslim_data->c_str());
-                    copied = true;
-                }
-                source += 2;
-                continue;
-            } else if (*(source + 1) == 'i') {
-                if (options->tblsslim_index) {
-                    strcpy(dest, options->tblsslim_index->c_str());
-                    dest += strlen(options->tblsslim_index->c_str());
-                    copied = true;
-                }
-                source += 2;
-                continue;
-            } else if (*(source + 1) == 'm') {
-                if (options->droptemp) {
-                    strcpy(dest, "UNLOGGED");
-                    dest += 8;
-                    copied = true;
-                }
-                source += 2;
-                continue;
-            }
-        }
-        *(dest++) = *(source++);
-    }
-    *dest = 0;
-
-    string->assign(buffer);
 }
 
-middle_pgsql_t::table_desc::table_desc(options_t const *options,
-                                       char const *name, char const *create,
-                                       char const *prepare_query,
-                                       char const *prepare_intarray,
-                                       char const *array_indexes)
-: m_create(create), m_prepare_query(prepare_query),
-  m_prepare_intarray(prepare_intarray), m_array_indexes(array_indexes),
+static std::string build_sql(options_t const &options, char const *templ)
+{
+    std::string const using_tablespace{options.tblsslim_index.empty()
+                                           ? ""
+                                           : "USING INDEX TABLESPACE " +
+                                                 options.tblsslim_index};
+    return fmt::format(
+        templ, fmt::arg("prefix", options.prefix),
+        fmt::arg("schema", options.middle_dbschema.empty()
+                               ? ""
+                               : (options.middle_dbschema + ".")),
+        fmt::arg("unlogged", options.droptemp ? "UNLOGGED" : ""),
+        fmt::arg("using_tablespace", using_tablespace),
+        fmt::arg("data_tablespace", tablespace_clause(options.tblsslim_data)),
+        fmt::arg("index_tablespace", tablespace_clause(options.tblsslim_index)),
+        fmt::arg("way_node_index_id_shift", options.way_node_index_id_shift));
+}
+
+middle_pgsql_t::table_desc::table_desc(options_t const &options,
+                                       table_sql const &ts)
+: m_create_table(build_sql(options, ts.create_table)),
+  m_prepare_query(build_sql(options, ts.prepare_query)),
   m_copy_target(std::make_shared<db_target_descr_t>())
 {
-    m_copy_target->name = name;
+    m_copy_target->name = build_sql(options, ts.name);
+    m_copy_target->schema = options.middle_dbschema;
     m_copy_target->id = "id"; // XXX hardcoded column name
 
-    set_prefix_and_tbls(options, &m_copy_target->name);
-    set_prefix_and_tbls(options, &m_create);
-    set_prefix_and_tbls(options, &m_prepare_query);
-    set_prefix_and_tbls(options, &m_prepare_intarray);
-    set_prefix_and_tbls(options, &m_array_indexes);
-}
-
-pg_result_t middle_query_pgsql_t::exec_prepared(char const *stmt,
-                                                char const *param) const
-{
-    return m_sql_conn.exec_prepared(stmt, 1, &param);
-}
-
-pg_result_t middle_query_pgsql_t::exec_prepared(char const *stmt,
-                                                osmid_t osm_id) const
-{
-    char buffer[64];
-    snprintf(buffer, sizeof(buffer), "%" PRIdOSMID, osm_id);
-    return exec_prepared(stmt, buffer);
-}
-
-pg_result_t middle_pgsql_t::exec_prepared(char const *stmt,
-                                          osmid_t osm_id) const
-{
-    char buffer[64];
-    snprintf(buffer, sizeof(buffer), "%" PRIdOSMID, osm_id);
-    char const *const bptr = buffer;
-    return m_query_conn->exec_prepared(stmt, 1, &bptr);
+    if (options.with_forward_dependencies) {
+        m_prepare_fw_dep_lookups =
+            build_sql(options, ts.prepare_fw_dep_lookups);
+        m_create_fw_dep_indexes = build_sql(options, ts.create_fw_dep_indexes);
+    }
 }
 
 void middle_query_pgsql_t::exec_sql(std::string const &sql_cmd) const
@@ -166,38 +85,37 @@ void middle_query_pgsql_t::exec_sql(std::string const &sql_cmd) const
     m_sql_conn.exec(sql_cmd);
 }
 
-void middle_pgsql_t::table_desc::stop(std::string conninfo, bool droptemp,
-                                      bool build_indexes)
+void middle_pgsql_t::table_desc::stop(std::string const &conninfo,
+                                      bool droptemp, bool build_indexes)
 {
-    time_t start, end;
-
-    fprintf(stderr, "Stopping table: %s\n", name());
-    time(&start);
+    log_info("Stopping table: {}", name());
+    util::timer_t timer;
 
     // Use a temporary connection here because we might run in a separate
     // thread context.
-    pg_conn_t sql_conn(conninfo);
+    pg_conn_t sql_conn{conninfo};
 
     if (droptemp) {
-        sql_conn.exec("DROP TABLE {}"_format(name()));
-    } else if (build_indexes && !m_array_indexes.empty()) {
-        fprintf(stderr, "Building index on table: %s\n", name());
-        sql_conn.exec(m_array_indexes);
+        auto const qual_name = qualified_name(
+            m_copy_target->schema, m_copy_target->name);
+        sql_conn.exec("DROP TABLE IF EXISTS {}"_format(qual_name));
+    } else if (build_indexes && !m_create_fw_dep_indexes.empty()) {
+        log_info("Building index on table: {}", name());
+        sql_conn.exec(m_create_fw_dep_indexes);
     }
 
-    time(&end);
-
-    fprintf(stderr, "Stopped table: %s in %is\n", name(), (int)(end - start));
+    log_info("Stopped table: {} in {}", name(),
+             util::human_readable_duration(timer.stop()));
 }
 
 namespace {
 // Decodes a portion of an array literal from postgres */
 // Argument should point to beginning of literal, on return points to delimiter */
-inline const char *decode_upto(const char *src, char *dst)
+inline char const *decode_upto(char const *src, char *dst)
 {
-    int quoted = (*src == '"');
+    bool const quoted = (*src == '"');
     if (quoted) {
-        src++;
+        ++src;
     }
 
     while (quoted ? (*src != '"') : (*src != ',' && *src != '}')) {
@@ -219,14 +137,14 @@ inline const char *decode_upto(const char *src, char *dst)
         }
     }
     if (quoted) {
-        src++;
+        ++src;
     }
     *dst = 0;
     return src;
 }
 
 template <typename T>
-void pgsql_parse_tags(const char *string, osmium::memory::Buffer &buffer,
+void pgsql_parse_tags(char const *string, osmium::memory::Buffer &buffer,
                       T &obuilder)
 {
     if (*string++ != '{') {
@@ -235,22 +153,22 @@ void pgsql_parse_tags(const char *string, osmium::memory::Buffer &buffer,
 
     char key[1024];
     char val[1024];
-    osmium::builder::TagListBuilder builder(buffer, &obuilder);
+    osmium::builder::TagListBuilder builder{buffer, &obuilder};
 
     while (*string != '}') {
         string = decode_upto(string, key);
         // String points to the comma */
-        string++;
+        ++string;
         string = decode_upto(string, val);
         builder.add_tag(key, val);
         // String points to the comma or closing '}' */
         if (*string == ',') {
-            string++;
+            ++string;
         }
     }
 }
 
-void pgsql_parse_members(const char *string, osmium::memory::Buffer &buffer,
+void pgsql_parse_members(char const *string, osmium::memory::Buffer &buffer,
                          osmium::builder::RelationBuilder &obuilder)
 {
     if (*string++ != '{') {
@@ -258,33 +176,33 @@ void pgsql_parse_members(const char *string, osmium::memory::Buffer &buffer,
     }
 
     char role[1024];
-    osmium::builder::RelationMemberListBuilder builder(buffer, &obuilder);
+    osmium::builder::RelationMemberListBuilder builder{buffer, &obuilder};
 
     while (*string != '}') {
         char type = string[0];
-        char *endp;
-        osmid_t id = strtoosmid(string + 1, &endp, 10);
+        char *endp = nullptr;
+        osmid_t id = std::strtoll(string + 1, &endp, 10);
         // String points to the comma */
         string = decode_upto(endp + 1, role);
         builder.add_member(osmium::char_to_item_type(type), id, role);
         // String points to the comma or closing '}' */
         if (*string == ',') {
-            string++;
+            ++string;
         }
     }
 }
 
-void pgsql_parse_nodes(const char *string, osmium::memory::Buffer &buffer,
+void pgsql_parse_nodes(char const *string, osmium::memory::Buffer &buffer,
                        osmium::builder::WayBuilder &builder)
 {
     if (*string++ == '{') {
-        osmium::builder::WayNodeListBuilder wnl_builder(buffer, &builder);
+        osmium::builder::WayNodeListBuilder wnl_builder{buffer, &builder};
         while (*string != '}') {
-            char *ptr;
-            wnl_builder.add_node_ref(strtoosmid(string, &ptr, 10));
+            char *ptr = nullptr;
+            wnl_builder.add_node_ref(std::strtoll(string, &ptr, 10));
             string = ptr;
             if (*string == ',') {
-                string++;
+                ++string;
             }
         }
     }
@@ -317,46 +235,67 @@ void middle_pgsql_t::buffer_store_tags(osmium::OSMObject const &obj, bool attrs)
     }
 }
 
+/**
+ * Class for building a stringified list of ids in the format "{id1,id2,id3}"
+ * for use in PostgreSQL queries.
+ */
+class string_id_list
+{
+public:
+    void add(osmid_t id)
+    {
+        fmt::format_to(std::back_inserter(m_list), "{},", id);
+    }
+
+    bool empty() const noexcept { return m_list.size() == 1; }
+
+    std::string const &get()
+    {
+        assert(!empty());
+        m_list.back() = '}';
+        return m_list;
+    }
+
+private:
+    std::string m_list{"{"};
+
+}; // class string_id_list
+
 size_t
 middle_query_pgsql_t::local_nodes_get_list(osmium::WayNodeList *nodes) const
 {
     size_t count = 0;
-    std::string buffer("{");
+    string_id_list id_list;
 
     // get nodes where possible from cache,
     // at the same time build a list for querying missing nodes from DB
-    size_t pos = 0;
     for (auto &n : *nodes) {
-        auto loc = m_cache->get(n.ref());
+        auto const loc = m_cache->get(n.ref());
         if (loc.valid()) {
             n.set_location(loc);
             ++count;
         } else {
-            buffer += std::to_string(n.ref());
-            buffer += ',';
+            id_list.add(n.ref());
         }
-        ++pos;
     }
 
-    if (count == pos) {
-        return count; // all ids found in cache, nothing more to do
+    if (id_list.empty()) {
+        return count;
     }
 
     // get any remaining nodes from the DB
-    buffer[buffer.size() - 1] = '}';
-
     // Nodes must have been written back at this point.
-    auto const res = exec_prepared("get_node_list", buffer.c_str());
+    auto const res = m_sql_conn.exec_prepared("get_node_list", id_list.get());
     std::unordered_map<osmid_t, osmium::Location> locs;
     for (int i = 0; i < res.num_tuples(); ++i) {
         locs.emplace(
             osmium::string_to_object_id(res.get_value(i, 0)),
-            osmium::Location{(int)strtol(res.get_value(i, 2), nullptr, 10),
-                             (int)strtol(res.get_value(i, 1), nullptr, 10)});
+            osmium::Location{(int)strtol(res.get_value(i, 1), nullptr, 10),
+                             (int)strtol(res.get_value(i, 2), nullptr, 10)});
     }
 
     for (auto &n : *nodes) {
-        auto el = locs.find(n.ref());
+        auto const el = locs.find(n.ref());
         if (el != locs.end()) {
             n.set_location(el->second);
             ++count;
@@ -366,14 +305,14 @@ middle_query_pgsql_t::local_nodes_get_list(osmium::WayNodeList *nodes) const
     return count;
 }
 
-void middle_pgsql_t::nodes_set(osmium::Node const &node)
+void middle_pgsql_t::node_set(osmium::Node const &node)
 {
-    cache->set(node.id(), node.location());
+    m_cache->set(node.id(), node.location());
 
-    if (out_options->flat_node_cache_enabled) {
-        persistent_cache->set(node.id(), node.location());
+    if (m_out_options->flat_node_cache_enabled) {
+        m_persistent_cache->set(node.id(), node.location());
     } else {
-        m_db_copy.new_line(tables[NODE_TABLE].m_copy_target);
+        m_db_copy.new_line(m_tables[NODE_TABLE].m_copy_target);
 
         m_db_copy.add_columns(node.id(), node.location().y(),
                               node.location().x());
@@ -388,40 +327,47 @@ size_t middle_query_pgsql_t::nodes_get_list(osmium::WayNodeList *nodes) const
                               : local_nodes_get_list(nodes);
 }
 
-void middle_pgsql_t::nodes_delete(osmid_t osm_id)
+void middle_pgsql_t::node_delete(osmid_t osm_id)
 {
-    if (out_options->flat_node_cache_enabled) {
-        persistent_cache->set(osm_id, osmium::Location());
+    assert(m_append);
+
+    if (m_out_options->flat_node_cache_enabled) {
+        m_persistent_cache->set(osm_id, osmium::Location{});
     } else {
-        m_db_copy.new_line(tables[NODE_TABLE].m_copy_target);
+        m_db_copy.new_line(m_tables[NODE_TABLE].m_copy_target);
         m_db_copy.delete_object(osm_id);
     }
 }
 
-void middle_pgsql_t::node_changed(osmid_t osm_id)
+idlist_t middle_pgsql_t::get_ids(const char* stmt, osmid_t osm_id)
 {
-    if (!mark_pending) {
-        return;
-    }
+    idlist_t ids;
 
-    //keep track of whatever ways and rels these nodes intersect
-    auto res = exec_prepared("mark_ways_by_node", osm_id);
-    for (int i = 0; i < res.num_tuples(); ++i) {
-        osmid_t const marked = osmium::string_to_object_id(res.get_value(i, 0));
-        ways_pending_tracker->mark(marked);
-    }
+    auto const res = m_db_connection.exec_prepared(stmt, osm_id);
+    ids.reserve(res.num_tuples());
+    for_each_id(res, [&ids](osmid_t id) { ids.push_back(id); });
 
-    //do the rels too
-    res = exec_prepared("mark_rels_by_node", osm_id);
-    for (int i = 0; i < res.num_tuples(); ++i) {
-        osmid_t const marked = osmium::string_to_object_id(res.get_value(i, 0));
-        rels_pending_tracker->mark(marked);
-    }
+    return ids;
 }
 
-void middle_pgsql_t::ways_set(osmium::Way const &way)
+idlist_t middle_pgsql_t::get_ways_by_node(osmid_t osm_id)
 {
-    m_db_copy.new_line(tables[WAY_TABLE].m_copy_target);
+    return get_ids("mark_ways_by_node", osm_id);
+}
+
+idlist_t middle_pgsql_t::get_rels_by_node(osmid_t osm_id)
+{
+    return get_ids("mark_rels_by_node", osm_id);
+}
+
+idlist_t middle_pgsql_t::get_rels_by_way(osmid_t osm_id)
+{
+    return get_ids("mark_rels_by_way", osm_id);
+}
+
+void middle_pgsql_t::way_set(osmium::Way const &way)
+{
+    m_db_copy.new_line(m_tables[WAY_TABLE].m_copy_target);
 
     m_db_copy.add_column(way.id());
 
@@ -432,22 +378,22 @@ void middle_pgsql_t::ways_set(osmium::Way const &way)
     }
     m_db_copy.finish_array();
 
-    buffer_store_tags(way, out_options->extra_attributes);
+    buffer_store_tags(way, m_out_options->extra_attributes);
 
     m_db_copy.finish_line();
 }
 
-bool middle_query_pgsql_t::ways_get(osmid_t id,
-                                    osmium::memory::Buffer &buffer) const
+bool middle_query_pgsql_t::way_get(osmid_t id,
+                                   osmium::memory::Buffer &buffer) const
 {
-    auto const res = exec_prepared("get_way", id);
+    auto const res = m_sql_conn.exec_prepared("get_way", id);
 
     if (res.num_tuples() != 1) {
         return false;
     }
 
     {
-        osmium::builder::WayBuilder builder(buffer);
+        osmium::builder::WayBuilder builder{buffer};
         builder.set_id(id);
 
         pgsql_parse_nodes(res.get_value(0, 0), buffer, builder);
@@ -464,29 +410,23 @@ middle_query_pgsql_t::rel_way_members_get(osmium::Relation const &rel,
                                           rolelist_t *roles,
                                           osmium::memory::Buffer &buffer) const
 {
-    char tmp[16];
+    string_id_list id_list;
 
-    // create a list of ids in tmp2 to query the database
-    std::string tmp2("{");
     for (auto const &m : rel.members()) {
         if (m.type() == osmium::item_type::way) {
-            snprintf(tmp, sizeof(tmp), "%" PRIdOSMID ",", m.ref());
-            tmp2.append(tmp);
+            id_list.add(m.ref());
         }
     }
 
-    if (tmp2.length() == 1) {
-        return 0; // no ways found
+    if (id_list.empty()) {
+        return 0;
     }
-    // replace last , with } to complete list of ids
-    tmp2[tmp2.length() - 1] = '}';
 
-    // Make sures all ways have been written back.
-    auto const res = exec_prepared("get_way_list", tmp2.c_str());
+    auto const res = m_sql_conn.exec_prepared("get_way_list", id_list.get());
     idlist_t wayidspg;
-    for (int i = 0; i < res.num_tuples(); ++i) {
-        wayidspg.push_back(osmium::string_to_object_id(res.get_value(i, 0)));
-    }
+    for_each_id(res, [&wayidspg](osmid_t id) {
+        wayidspg.push_back(id);
+    });
 
     // Match the list of ways coming from postgres in a different order
     //   back to the list of ways given by the caller */
@@ -498,7 +438,7 @@ middle_query_pgsql_t::rel_way_members_get(osmium::Relation const &rel,
         for (int j = 0; j < res.num_tuples(); ++j) {
             if (m.ref() == wayidspg[j]) {
                 {
-                    osmium::builder::WayBuilder builder(buffer);
+                    osmium::builder::WayBuilder builder{buffer};
                     builder.set_id(m.ref());
 
                     pgsql_parse_nodes(res.get_value(j, 1), buffer, builder);
@@ -509,7 +449,7 @@ middle_query_pgsql_t::rel_way_members_get(osmium::Relation const &rel,
                 if (roles) {
                     roles->emplace_back(m.role());
                 }
-                outres++;
+                ++outres;
                 break;
             }
         }
@@ -518,37 +458,14 @@ middle_query_pgsql_t::rel_way_members_get(osmium::Relation const &rel,
     return outres;
 }
 
-void middle_pgsql_t::ways_delete(osmid_t osm_id)
+void middle_pgsql_t::way_delete(osmid_t osm_id)
 {
-    m_db_copy.new_line(tables[WAY_TABLE].m_copy_target);
+    assert(m_append);
+    m_db_copy.new_line(m_tables[WAY_TABLE].m_copy_target);
     m_db_copy.delete_object(osm_id);
 }
 
-void middle_pgsql_t::iterate_ways(middle_t::pending_processor &pf)
-{
-    // enqueue the jobs
-    osmid_t id;
-    while (id_tracker::is_valid(id = ways_pending_tracker->pop_mark())) {
-        pf.enqueue_ways(id);
-    }
-    // in case we had higher ones than the middle
-    pf.enqueue_ways(id_tracker::max());
-
-    //let the threads work on them
-    pf.process_ways();
-}
-
-void middle_pgsql_t::way_changed(osmid_t osm_id)
-{
-    //keep track of whatever rels this way intersects
-    auto const res = exec_prepared("mark_rels_by_way", osm_id);
-    for (int i = 0; i < res.num_tuples(); ++i) {
-        osmid_t const marked = osmium::string_to_object_id(res.get_value(i, 0));
-        rels_pending_tracker->mark(marked);
-    }
-}
-
-void middle_pgsql_t::relations_set(osmium::Relation const &rel)
+void middle_pgsql_t::relation_set(osmium::Relation const &rel)
 {
     // Sort relation members by their type.
     idlist_t parts[3];
@@ -557,7 +474,7 @@ void middle_pgsql_t::relations_set(osmium::Relation const &rel)
         parts[osmium::item_type_to_nwr_index(m.type())].push_back(m.ref());
     }
 
-    m_db_copy.new_line(tables[REL_TABLE].m_copy_target);
+    m_db_copy.new_line(m_tables[REL_TABLE].m_copy_target);
 
     // id, way offset, relation offset
     m_db_copy.add_columns(rel.id(), parts[0].size(),
@@ -565,8 +482,8 @@ void middle_pgsql_t::relations_set(osmium::Relation const &rel)
 
     // parts
     m_db_copy.new_array();
-    for (int i = 0; i < 3; ++i) {
-        for (auto it : parts[i]) {
+    for (auto const &part : parts) {
+        for (auto it : part) {
             m_db_copy.add_array_elem(it);
         }
     }
@@ -586,15 +503,15 @@ void middle_pgsql_t::relations_set(osmium::Relation const &rel)
     }
 
     // tags
-    buffer_store_tags(rel, out_options->extra_attributes);
+    buffer_store_tags(rel, m_out_options->extra_attributes);
 
     m_db_copy.finish_line();
 }
 
-bool middle_query_pgsql_t::relations_get(osmid_t id,
-                                         osmium::memory::Buffer &buffer) const
+bool middle_query_pgsql_t::relation_get(osmid_t id,
+                                        osmium::memory::Buffer &buffer) const
 {
-    auto const res = exec_prepared("get_rel", id);
+    auto const res = m_sql_conn.exec_prepared("get_rel", id);
     // Fields are: members, tags, member_count */
     //
     if (res.num_tuples() != 1) {
@@ -602,7 +519,7 @@ bool middle_query_pgsql_t::relations_get(osmid_t id,
     }
 
     {
-        osmium::builder::RelationBuilder builder(buffer);
+        osmium::builder::RelationBuilder builder{buffer};
         builder.set_id(id);
 
         pgsql_parse_members(res.get_value(0, 0), buffer, builder);
@@ -614,62 +531,18 @@ bool middle_query_pgsql_t::relations_get(osmid_t id,
     return true;
 }
 
-void middle_pgsql_t::relations_delete(osmid_t osm_id)
+void middle_pgsql_t::relation_delete(osmid_t osm_id)
 {
-    //keep track of whatever ways this relation interesects
-    auto const res = exec_prepared("mark_ways_by_rel", osm_id);
-    for (int i = 0; i < res.num_tuples(); ++i) {
-        osmid_t const marked = osmium::string_to_object_id(res.get_value(i, 0));
-        ways_pending_tracker->mark(marked);
-    }
+    assert(m_append);
 
-    m_db_copy.new_line(tables[REL_TABLE].m_copy_target);
+    m_db_copy.new_line(m_tables[REL_TABLE].m_copy_target);
     m_db_copy.delete_object(osm_id);
-}
-
-void middle_pgsql_t::iterate_relations(pending_processor &pf)
-{
-    // enqueue the jobs
-    osmid_t id;
-    while (id_tracker::is_valid(id = rels_pending_tracker->pop_mark())) {
-        pf.enqueue_relations(id);
-    }
-    // in case we had higher ones than the middle
-    pf.enqueue_relations(id_tracker::max());
-
-    //let the threads work on them
-    pf.process_relations();
-}
-
-void middle_pgsql_t::relation_changed(osmid_t osm_id)
-{
-    //keep track of whatever ways and rels these nodes intersect
-    //TODO: dont need to stop the copy above since we are only reading?
-    //TODO: can we just mark the id without querying? the where clause seems intersect reltable.parts with the id
-    auto const res = exec_prepared("mark_rels", osm_id);
-    for (int i = 0; i < res.num_tuples(); ++i) {
-        osmid_t const marked = osmium::string_to_object_id(res.get_value(i, 0));
-        rels_pending_tracker->mark(marked);
-    }
-}
-
-idlist_t middle_query_pgsql_t::relations_using_way(osmid_t way_id) const
-{
-    auto const result = exec_prepared("rels_using_way", way_id);
-    int const ntuples = result.num_tuples();
-    idlist_t rel_ids;
-    rel_ids.resize((size_t)ntuples);
-    for (int i = 0; i < ntuples; ++i) {
-        rel_ids[i] = osmium::string_to_object_id(result.get_value(i, 0));
-    }
-
-    return rel_ids;
 }
 
 void middle_pgsql_t::analyze()
 {
-    for (auto &t : tables) {
-        m_query_conn->exec("ANALYZE {}"_format(t.name()));
+    for (auto const &table : m_tables) {
+        m_db_connection.exec("ANALYZE {}"_format(table.name()));
     }
 }
 
@@ -677,45 +550,41 @@ middle_query_pgsql_t::middle_query_pgsql_t(
     std::string const &conninfo, std::shared_ptr<node_ram_cache> const &cache,
     std::shared_ptr<node_persistent_cache> const &persistent_cache)
 : m_sql_conn(conninfo), m_cache(cache), m_persistent_cache(persistent_cache)
-{}
+{
+    // Disable JIT and parallel workers as they are known to cause
+    // problems when accessing the intarrays.
+    m_sql_conn.set_config("jit_above_cost", "-1");
+    m_sql_conn.set_config("max_parallel_workers_per_gather", "0");
+}
 
 void middle_pgsql_t::start()
 {
-    ways_pending_tracker.reset(new id_tracker());
-    rels_pending_tracker.reset(new id_tracker());
+    if (m_append) {
+        // Disable JIT and parallel workers as they are known to cause
+        // problems when accessing the intarrays.
+        m_db_connection.set_config("jit_above_cost", "-1");
+        m_db_connection.set_config("max_parallel_workers_per_gather", "0");
 
-    // Gazetter doesn't use mark-pending processing and consequently
-    // needs no way-node index.
-    // TODO Currently, set here to keep the impact on the code small.
-    // We actually should have the output plugins report their needs
-    // and pass that via the constructor to middle_t, so that middle_t
-    // itself doesn't need to know about details of the output.
-    if (out_options->output_backend == "gazetteer") {
-        tables[WAY_TABLE].clear_array_indexes();
-        mark_pending = false;
-    }
-
-    m_query_conn.reset(new pg_conn_t{out_options->database_options.conninfo()});
-
-    if (append) {
         // Prepare queries for updating dependent objects
-        for (auto &table : tables) {
-            if (!table.m_prepare_intarray.empty()) {
-                m_query_conn->exec(table.m_prepare_intarray);
+        for (auto &table : m_tables) {
+            if (!table.m_prepare_fw_dep_lookups.empty()) {
+                m_db_connection.exec(table.m_prepare_fw_dep_lookups);
             }
         }
     } else {
         // (Re)create tables.
-        m_query_conn->exec("SET client_min_messages = WARNING");
-        for (auto &table : tables) {
-            fprintf(stderr, "Setting up table: %s\n", table.name());
-            m_query_conn->exec(
-                "DROP TABLE IF EXISTS {} CASCADE"_format(table.name()));
-            m_query_conn->exec(table.m_create);
+        m_db_connection.exec("SET client_min_messages = WARNING");
+        for (auto const &table : m_tables) {
+            log_info("Setting up table: {}", table.name());
+            auto const qual_name = qualified_name(
+                table.m_copy_target->schema, table.m_copy_target->name);
+            m_db_connection.exec(
+                "DROP TABLE IF EXISTS {} CASCADE"_format(qual_name));
+            m_db_connection.exec(table.m_create_table);
         }
 
         // The extra query connection is only needed in append mode, so close.
-        m_query_conn.reset();
+        m_db_connection.close();
     }
 }
 
@@ -724,108 +593,198 @@ void middle_pgsql_t::commit()
     m_db_copy.sync();
     // release the copy thread and its query connection
     m_copy_thread->finish();
-
-    m_query_conn.reset();
 }
 
-void middle_pgsql_t::flush(osmium::item_type) { m_db_copy.sync(); }
+void middle_pgsql_t::flush() { m_db_copy.sync(); }
 
-void middle_pgsql_t::stop(osmium::thread::Pool &pool)
+void middle_pgsql_t::stop(thread_pool_t &pool)
 {
-    cache.reset();
-    if (out_options->flat_node_cache_enabled) {
-        persistent_cache.reset();
+    m_cache.reset();
+    if (m_out_options->flat_node_cache_enabled) {
+        m_persistent_cache.reset();
     }
 
-    if (out_options->droptemp) {
+    if (m_out_options->droptemp) {
         // Dropping the tables is fast, so do it synchronously to guarantee
         // that the space is freed before creating the other indices.
-        for (auto &t : tables) {
-            t.stop(out_options->database_options.conninfo(),
-                   out_options->droptemp, !append);
+        for (auto &table : m_tables) {
+            table.stop(m_out_options->database_options.conninfo(),
+                       m_out_options->droptemp, !m_append);
         }
     } else {
-        for (auto &t : tables) {
-            pool.submit(std::bind(&middle_pgsql_t::table_desc::stop, &t,
-                                  out_options->database_options.conninfo(),
-                                  out_options->droptemp, !append));
+        for (auto &table : m_tables) {
+            pool.submit(std::bind(&middle_pgsql_t::table_desc::stop, &table,
+                                  m_out_options->database_options.conninfo(),
+                                  m_out_options->droptemp, !m_append));
         }
     }
+}
+
+static table_sql sql_for_nodes(bool create_table) noexcept
+{
+    table_sql sql{};
+
+    sql.name = "{prefix}_nodes";
+
+    if (create_table) {
+        sql.create_table = "CREATE {unlogged} TABLE {schema}{prefix}_nodes ("
+                           "  id int8 PRIMARY KEY {using_tablespace},"
+                           "  lat int4 NOT NULL,"
+                           "  lon int4 NOT NULL"
+                           ") {data_tablespace};\n";
+
+        sql.prepare_query = "PREPARE get_node_list(int8[]) AS"
+                            "  SELECT id, lon, lat FROM {schema}{prefix}_nodes"
+                            "  WHERE id = ANY($1::int8[]);\n";
+    }
+
+    return sql;
+}
+
+static table_sql sql_for_ways(bool has_bucket_index,
+                              uint8_t way_node_index_id_shift) noexcept
+{
+    table_sql sql{};
+
+    sql.name = "{prefix}_ways";
+
+    sql.create_table = "CREATE {unlogged} TABLE {schema}{prefix}_ways ("
+                       "  id int8 PRIMARY KEY {using_tablespace},"
+                       "  nodes int8[] NOT NULL,"
+                       "  tags text[]"
+                       ") {data_tablespace};\n";
+
+    sql.prepare_query = "PREPARE get_way(int8) AS"
+                        "  SELECT nodes, tags"
+                        "    FROM {schema}{prefix}_ways WHERE id = $1;\n"
+                        "PREPARE get_way_list(int8[]) AS"
+                        "  SELECT id, nodes, tags"
+                        "    FROM {schema}{prefix}_ways"
+                        "      WHERE id = ANY($1::int8[]);\n";
+
+    if (has_bucket_index) {
+        sql.prepare_fw_dep_lookups =
+            "PREPARE mark_ways_by_node(int8) AS"
+            "  SELECT id FROM {schema}{prefix}_ways w"
+            "    WHERE $1 = ANY(nodes)"
+            "      AND {schema}{prefix}_index_bucket(w.nodes)"
+            "       && {schema}{prefix}_index_bucket(ARRAY[$1]);\n";
+    } else {
+        sql.prepare_fw_dep_lookups = "PREPARE mark_ways_by_node(int8) AS"
+                                     "  SELECT id FROM {schema}{prefix}_ways"
+                                     "    WHERE nodes && ARRAY[$1];\n";
+    }
+
+    if (way_node_index_id_shift == 0) {
+        sql.create_fw_dep_indexes =
+            "CREATE INDEX ON {schema}{prefix}_ways USING GIN (nodes)"
+            "  WITH (fastupdate = off) {index_tablespace};\n";
+    } else {
+        sql.create_fw_dep_indexes =
+            "CREATE OR REPLACE FUNCTION"
+            "    {schema}{prefix}_index_bucket(int8[])"
+            "  RETURNS int8[] AS $$\n"
+            "  SELECT ARRAY(SELECT DISTINCT"
+            "    unnest($1) >> {way_node_index_id_shift})\n"
+            "$$ LANGUAGE SQL IMMUTABLE;\n"
+            "CREATE INDEX {schema}{prefix}_ways_nodes_bucket_idx"
+            "  ON {schema}{prefix}_ways"
+            "  USING GIN ({schema}{prefix}_index_bucket(nodes))"
+            "  WITH (fastupdate = off) {index_tablespace};\n";
+    }
+
+    return sql;
+}
+
+static table_sql sql_for_relations() noexcept
+{
+    table_sql sql{};
+
+    sql.name = "{prefix}_rels";
+
+    sql.create_table = "CREATE {unlogged} TABLE {schema}{prefix}_rels ("
+                       "  id int8 PRIMARY KEY {using_tablespace},"
+                       "  way_off int2,"
+                       "  rel_off int2,"
+                       "  parts int8[],"
+                       "  members text[],"
+                       "  tags text[]"
+                       ") {data_tablespace};\n";
+
+    sql.prepare_query = "PREPARE get_rel(int8) AS"
+                        "  SELECT members, tags"
+                        "    FROM {schema}{prefix}_rels WHERE id = $1;\n";
+
+    sql.prepare_fw_dep_lookups =
+        "PREPARE mark_rels_by_node(int8) AS"
+        "  SELECT id FROM {schema}{prefix}_rels"
+        "    WHERE parts && ARRAY[$1]"
+        "      AND parts[1:way_off] && ARRAY[$1];\n"
+        "PREPARE mark_rels_by_way(int8) AS"
+        "  SELECT id FROM {schema}{prefix}_rels"
+        "    WHERE parts && ARRAY[$1]"
+        "      AND parts[way_off+1:rel_off] && ARRAY[$1];\n";
+
+    sql.create_fw_dep_indexes =
+        "CREATE INDEX ON {schema}{prefix}_rels USING GIN (parts)"
+        "  WITH (fastupdate = off) {index_tablespace};\n";
+
+    return sql;
+}
+
+static bool check_bucket_index(pg_conn_t *db_connection,
+                               std::string const &prefix)
+{
+    auto const res = db_connection->query(
+        PGRES_TUPLES_OK,
+        "SELECT relname FROM pg_class WHERE relkind='i' AND"
+        "  relname = '{}_ways_nodes_bucket_idx';"_format(prefix));
+    return res.num_tuples() > 0;
 }
 
 middle_pgsql_t::middle_pgsql_t(options_t const *options)
-: append(options->append), mark_pending(true), out_options(options),
-  cache(new node_ram_cache(options->alloc_chunkwise | ALLOC_LOSSY,
-                           options->cache)),
+: m_append(options->append), m_out_options(options),
+  m_cache(new node_ram_cache{options->alloc_chunkwise | ALLOC_LOSSY,
+                             options->cache}),
+  m_db_connection(m_out_options->database_options.conninfo()),
   m_copy_thread(
       std::make_shared<db_copy_thread_t>(options->database_options.conninfo())),
   m_db_copy(m_copy_thread)
 {
     if (options->flat_node_cache_enabled) {
-        persistent_cache.reset(new node_persistent_cache(options, cache));
+        m_persistent_cache.reset(new node_persistent_cache{options, m_cache});
     }
 
-    fprintf(stderr, "Mid: pgsql, cache=%d\n", options->cache);
+    log_info("Mid: pgsql, cache={}", options->cache);
 
-    // clang-format off
-    /*table = t_node,*/
-    tables[NODE_TABLE] = table_desc(options,
-            /*name*/ "%p_nodes",
-          /*create*/ "CREATE %m TABLE %p_nodes (id " POSTGRES_OSMID_TYPE " PRIMARY KEY {USING INDEX TABLESPACE %i}, lat int4 not null, lon int4 not null) {TABLESPACE %t};\n",
-         /*prepare_query */
-               "PREPARE get_node_list(" POSTGRES_OSMID_TYPE "[]) AS SELECT id, lat, lon FROM %p_nodes WHERE id = ANY($1::" POSTGRES_OSMID_TYPE "[]);\n"
-                         );
-    tables[WAY_TABLE] = table_desc(options,
-        /*table t_way,*/
-            /*name*/ "%p_ways",
-          /*create*/ "CREATE %m TABLE %p_ways (id " POSTGRES_OSMID_TYPE " PRIMARY KEY {USING INDEX TABLESPACE %i}, nodes " POSTGRES_OSMID_TYPE "[] not null, tags text[]) {TABLESPACE %t};\n",
-         /*prepare_query */
-               "PREPARE get_way (" POSTGRES_OSMID_TYPE ") AS SELECT nodes, tags, array_upper(nodes,1) FROM %p_ways WHERE id = $1;\n"
-               "PREPARE get_way_list (" POSTGRES_OSMID_TYPE "[]) AS SELECT id, nodes, tags, array_upper(nodes,1) FROM %p_ways WHERE id = ANY($1::" POSTGRES_OSMID_TYPE "[]);\n",
-/*prepare_intarray*/
-               "PREPARE mark_ways_by_node(" POSTGRES_OSMID_TYPE ") AS select id from %p_ways WHERE nodes && ARRAY[$1];\n"
-               "PREPARE mark_ways_by_rel(" POSTGRES_OSMID_TYPE ") AS select id from %p_ways WHERE id IN (SELECT unnest(parts[way_off+1:rel_off]) FROM %p_rels WHERE id = $1);\n",
+    bool const has_bucket_index =
+        check_bucket_index(&m_db_connection, options->prefix);
 
-   /*array_indexes*/ "CREATE INDEX %p_ways_nodes ON %p_ways USING gin (nodes) WITH (FASTUPDATE=OFF) {TABLESPACE %i};\n"
-                         );
-    tables[REL_TABLE] = table_desc(options, 
-        /*table = t_rel,*/
-            /*name*/ "%p_rels",
-          /*create*/ "CREATE %m TABLE %p_rels(id " POSTGRES_OSMID_TYPE " PRIMARY KEY {USING INDEX TABLESPACE %i}, way_off int2, rel_off int2, parts " POSTGRES_OSMID_TYPE "[], members text[], tags text[]) {TABLESPACE %t};\n",
-         /*prepare_query */
-               "PREPARE get_rel (" POSTGRES_OSMID_TYPE ") AS SELECT members, tags, array_upper(members,1)/2 FROM %p_rels WHERE id = $1;\n"
-                "PREPARE rels_using_way(" POSTGRES_OSMID_TYPE ") AS SELECT id FROM %p_rels WHERE parts && ARRAY[$1] AND parts[way_off+1:rel_off] && ARRAY[$1];\n",
-/*prepare_intarray*/
-                "PREPARE mark_rels_by_node(" POSTGRES_OSMID_TYPE ") AS select id from %p_ways WHERE nodes && ARRAY[$1];\n"
-                "PREPARE mark_rels_by_way(" POSTGRES_OSMID_TYPE ") AS select id from %p_rels WHERE parts && ARRAY[$1] AND parts[way_off+1:rel_off] && ARRAY[$1];\n"
-                "PREPARE mark_rels(" POSTGRES_OSMID_TYPE ") AS select id from %p_rels WHERE parts && ARRAY[$1] AND parts[rel_off+1:array_length(parts,1)] && ARRAY[$1];\n",
+    if (!has_bucket_index && options->append) {
+        log_warn("You don't have a bucket index. See manual for details.");
+    }
 
-   /*array_indexes*/ "CREATE INDEX %p_rels_parts ON %p_rels USING gin (parts) WITH (FASTUPDATE=OFF) {TABLESPACE %i};\n"
-                         );
-    // clang-format on
+    m_tables[NODE_TABLE] =
+        table_desc{*options, sql_for_nodes(!options->flat_node_cache_enabled)};
+    m_tables[WAY_TABLE] =
+        table_desc{*options, sql_for_ways(has_bucket_index,
+                                          options->way_node_index_id_shift)};
+    m_tables[REL_TABLE] = table_desc{*options, sql_for_relations()};
 }
 
 std::shared_ptr<middle_query_t>
-middle_pgsql_t::get_query_instance(std::shared_ptr<middle_t> const &from) const
+middle_pgsql_t::get_query_instance()
 {
-    auto *src = dynamic_cast<middle_pgsql_t *>(from.get());
-    assert(src);
-
     // NOTE: this is thread safe for use in pending async processing only because
     // during that process they are only read from
-    std::unique_ptr<middle_query_pgsql_t> mid(new middle_query_pgsql_t(
-        src->out_options->database_options.conninfo().c_str(), src->cache,
-        src->persistent_cache));
+    std::unique_ptr<middle_query_pgsql_t> mid{
+        new middle_query_pgsql_t{m_out_options->database_options.conninfo(),
+                                 m_cache, m_persistent_cache}};
 
     // We use a connection per table to enable the use of COPY
-    for (int i = 0; i < NUM_TABLES; ++i) {
-        mid->exec_sql(src->tables[i].m_prepare_query);
+    for (auto &table : m_tables) {
+        mid->exec_sql(table.m_prepare_query);
     }
 
     return std::shared_ptr<middle_query_t>(mid.release());
-}
-
-size_t middle_pgsql_t::pending_count() const
-{
-    return ways_pending_tracker->size() + rels_pending_tracker->size();
 }

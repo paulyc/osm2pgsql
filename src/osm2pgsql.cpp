@@ -23,97 +23,120 @@
 #-----------------------------------------------------------------------------
 */
 
-#include "config.h"
-#include "db-copy.hpp"
+#include "db-check.hpp"
+#include "format.hpp"
+#include "logging.hpp"
 #include "middle-pgsql.hpp"
 #include "middle-ram.hpp"
 #include "options.hpp"
 #include "osmdata.hpp"
-#include "osmtypes.hpp"
 #include "output.hpp"
-#include "parse-osmium.hpp"
+#include "progress-display.hpp"
 #include "reprojection.hpp"
 #include "util.hpp"
+#include "version.hpp"
 
-#include <cstdio>
-#include <cstdlib>
 #include <ctime>
-#include <stdexcept>
-#include <string>
-#include <vector>
+#include <exception>
+#include <memory>
 
-#include <libpq-fe.h>
+static std::shared_ptr<middle_t> create_middle(options_t const &options)
+{
+    if (options.slim) {
+        return std::make_shared<middle_pgsql_t>(&options);
+    }
+
+    return std::make_shared<middle_ram_t>(&options);
+}
+
+/**
+ * Prepare input file(s). Does format checks as far as this is possible
+ * without actually opening the files.
+ */
+static std::vector<osmium::io::File>
+prepare_input_files(options_t const &options)
+{
+    std::vector<osmium::io::File> files;
+
+    for (auto const &filename : options.input_files) {
+        osmium::io::File file{filename, options.input_format};
+
+        if (file.format() == osmium::io::file_format::unknown) {
+            if (options.input_format.empty()) {
+                throw std::runtime_error{
+                    "Cannot detect file format. Try using -r."};
+            }
+            throw std::runtime_error{
+                "Unknown file format '{}'."_format(options.input_format)};
+        }
+
+        if (!options.append && file.has_multiple_object_versions()) {
+            throw std::runtime_error{
+                "Reading an OSM change file only works in append mode."};
+        }
+
+        log_info("Reading file: {}", filename);
+
+        files.emplace_back(file);
+    }
+
+    return files;
+}
 
 int main(int argc, char *argv[])
 {
-    fprintf(stderr, "osm2pgsql version %s (%zu bit id space)\n\n", VERSION,
-            8 * sizeof(osmid_t));
     try {
-        //parse the args into the different options members
-        options_t options = options_t(argc, argv);
+        log_info("osm2pgsql version {}", get_osm2pgsql_version());
+
+        options_t const options{argc, argv};
         if (options.long_usage_bool) {
             return 0;
         }
 
-        //setup the middle and backend (output)
-        std::shared_ptr<middle_t> middle;
+        check_db(options);
 
-        if (options.slim) {
-            // middle gets its own copy-in thread
-            middle = std::shared_ptr<middle_t>(new middle_pgsql_t(&options));
-        } else {
-            middle = std::shared_ptr<middle_t>(new middle_ram_t(&options));
-        }
+        auto const files = prepare_input_files(options);
 
+        auto middle = create_middle(options);
         middle->start();
 
-        auto outputs = output_t::create_outputs(
-            middle->get_query_instance(middle), options);
-        //let osmdata orchestrate between the middle and the outs
-        osmdata_t osmdata(middle, outputs);
+        auto const outputs =
+            output_t::create_outputs(middle->get_query_instance(), options);
 
-        fprintf(stderr, "Using projection SRS %d (%s)\n",
-                options.projection->target_srs(),
-                options.projection->target_desc());
+        auto dependency_manager = std::unique_ptr<dependency_manager_t>(
+            options.with_forward_dependencies
+                ? new full_dependency_manager_t{middle}
+                : new dependency_manager_t{});
 
-        //start it up
-        time_t overall_start = time(nullptr);
+        osmdata_t osmdata{std::move(dependency_manager), middle, outputs,
+                          options};
+
+        util::timer_t timer_overall;
         osmdata.start();
 
-        /* Processing
-         * In this phase the input file(s) are read and parsed, populating some of the
-         * tables. Not all ways can be handled before relations are processed, so they're
-         * set as pending, to be handled in the next stage.
-         */
-        parse_stats_t stats;
-        //read in the input files one by one
-        for (auto const filename : options.input_files) {
-            //read the actual input
-            fprintf(stderr, "\nReading in file: %s\n", filename.c_str());
-            time_t start = time(nullptr);
+        // Processing: In this phase the input file(s) are read and parsed,
+        // populating some of the tables.
+        progress_display_t progress;
 
-            parse_osmium_t parser(options.bbox, options.append, &osmdata);
-            parser.stream_file(filename, options.input_reader);
+        util::timer_t timer_parse;
 
-            stats.update(parser.stats());
+        progress.update(osmdata.process_files(files, options.bbox));
 
-            fprintf(stderr, "  parse time: %ds\n",
-                    (int)(time(nullptr) - start));
-        }
+        progress.print_status(std::time(nullptr));
+        fmt::print(stderr, "  parse time: {}\n",
+                   util::human_readable_duration(timer_parse.stop()));
 
-        //show stats
-        stats.print_summary();
+        progress.print_summary();
 
-        //Process pending ways, relations, cluster, and create indexes
+        // Process pending ways and relations. Cluster database tables and
+        // create indexes.
         osmdata.stop();
 
-        fprintf(stderr, "\nOsm2pgsql took %ds overall\n",
-                (int)(time(nullptr) - overall_start));
-
-        return 0;
-    } //something went wrong along the way
-    catch (const std::runtime_error &e) {
-        fprintf(stderr, "Osm2pgsql failed due to ERROR: %s\n", e.what());
-        exit(EXIT_FAILURE);
+        log_info("Osm2pgsql took {} overall",
+                 util::human_readable_duration(timer_overall.stop()));
+    } catch (std::exception const &e) {
+        log_error("{}", e.what());
+        return 1;
     }
+    return 0;
 }

@@ -1,6 +1,5 @@
 #include "output-multi.hpp"
 #include "expire-tiles.hpp"
-#include "id-tracker.hpp"
 #include "middle.hpp"
 #include "options.hpp"
 #include "table.hpp"
@@ -8,7 +7,6 @@
 #include "tagtransform.hpp"
 #include "wkb.hpp"
 
-#include <boost/algorithm/string/predicate.hpp>
 #include <vector>
 
 output_multi_t::output_multi_t(
@@ -24,15 +22,15 @@ output_multi_t::output_multi_t(
   m_osm_type(m_processor->interests(geometry_processor::interest_node)
                  ? osmium::item_type::node
                  : osmium::item_type::way),
-  m_table(new table_t(name, m_processor->column_type(),
+  m_table(new table_t{name, m_processor->column_type(),
                       export_list.normal_columns(m_osm_type),
                       m_options.hstore_columns, m_processor->srid(),
-                      m_options.append, m_options.hstore_mode, copy_thread)),
-  ways_done_tracker(new id_tracker()),
+                      m_options.append, m_options.hstore_mode, copy_thread,
+                      m_options.output_dbschema}),
   m_expire(m_options.expire_tiles_zoom, m_options.expire_tiles_max_bbox,
            m_options.projection),
   buffer(1024, osmium::memory::Buffer::auto_grow::yes),
-  m_builder(m_options.projection, m_options.enable_multi),
+  m_builder(m_options.projection),
   m_way_area(export_list.has_column(m_osm_type, "way_area"))
 {}
 
@@ -43,16 +41,11 @@ output_multi_t::output_multi_t(
   m_tagtransform(other->m_tagtransform->clone()),
   m_processor(other->m_processor), m_proj(other->m_proj),
   m_osm_type(other->m_osm_type),
-  m_table(new table_t(*other->m_table, copy_thread)),
-  // NOTE: we need to know which ways were used by relations so each thread
-  // must have a copy of the original marked done ways, its read only so its
-  // ok
-  ways_done_tracker(other->ways_done_tracker),
+  m_table(new table_t{*other->m_table, copy_thread}),
   m_expire(m_options.expire_tiles_zoom, m_options.expire_tiles_max_bbox,
            m_options.projection),
   buffer(1024, osmium::memory::Buffer::auto_grow::yes),
-  m_builder(m_options.projection, m_options.enable_multi),
-  m_way_area(other->m_way_area)
+  m_builder(m_options.projection), m_way_area(other->m_way_area)
 {}
 
 output_multi_t::~output_multi_t() = default;
@@ -62,7 +55,7 @@ std::shared_ptr<output_t> output_multi_t::clone(
     std::shared_ptr<db_copy_thread_t> const &copy_thread) const
 {
     return std::shared_ptr<output_t>(
-        new output_multi_t(this, mid, copy_thread));
+        new output_multi_t{this, mid, copy_thread});
 }
 
 void output_multi_t::start()
@@ -71,115 +64,27 @@ void output_multi_t::start()
                    m_options.tblsmain_data);
 }
 
-size_t output_multi_t::pending_count() const
-{
-    return ways_pending_tracker.size() + rels_pending_tracker.size();
-}
-
-void output_multi_t::enqueue_ways(pending_queue_t &job_queue, osmid_t id,
-                                  size_t output_id, size_t &added)
-{
-    osmid_t const prev = ways_pending_tracker.last_returned();
-    if (id_tracker::is_valid(prev) && prev >= id) {
-        if (prev > id) {
-            job_queue.push(pending_job_t(id, output_id));
-        }
-        // already done the job
-        return;
-    }
-
-    //make sure we get the one passed in
-    if (!ways_done_tracker->is_marked(id) && id_tracker::is_valid(id)) {
-        job_queue.push(pending_job_t(id, output_id));
-        added++;
-    }
-
-    //grab the first one or bail if its not valid
-    osmid_t popped = ways_pending_tracker.pop_mark();
-    if (!id_tracker::is_valid(popped)) {
-        return;
-    }
-
-    //get all the ones up to the id that was passed in
-    while (popped < id) {
-        if (!ways_done_tracker->is_marked(popped)) {
-            job_queue.push(pending_job_t(popped, output_id));
-            added++;
-        }
-        popped = ways_pending_tracker.pop_mark();
-    }
-
-    //make sure to get this one as well and move to the next
-    if (popped > id) {
-        if (!ways_done_tracker->is_marked(popped) &&
-            id_tracker::is_valid(popped)) {
-            job_queue.push(pending_job_t(popped, output_id));
-            added++;
-        }
-    }
-}
-
-void output_multi_t::pending_way(osmid_t id, int exists)
+void output_multi_t::pending_way(osmid_t id)
 {
     // Try to fetch the way from the DB
     buffer.clear();
-    if (m_mid->ways_get(id, buffer)) {
+    if (m_mid->way_get(id, buffer)) {
         // Output the way
-        reprocess_way(&buffer.get<osmium::Way>(0), exists);
+        reprocess_way(&buffer.get<osmium::Way>(0), true);
     }
 }
 
-void output_multi_t::enqueue_relations(pending_queue_t &job_queue, osmid_t id,
-                                       size_t output_id, size_t &added)
-{
-    osmid_t const prev = rels_pending_tracker.last_returned();
-    if (id_tracker::is_valid(prev) && prev >= id) {
-        if (prev > id) {
-            job_queue.push(pending_job_t(id, output_id));
-        }
-        // already done the job
-        return;
-    }
-
-    //make sure we get the one passed in
-    if (id_tracker::is_valid(id)) {
-        job_queue.push(pending_job_t(id, output_id));
-        added++;
-    }
-
-    //grab the first one or bail if its not valid
-    osmid_t popped = rels_pending_tracker.pop_mark();
-    if (!id_tracker::is_valid(popped)) {
-        return;
-    }
-
-    //get all the ones up to the id that was passed in
-    while (popped < id) {
-        job_queue.push(pending_job_t(popped, output_id));
-        added++;
-        popped = rels_pending_tracker.pop_mark();
-    }
-
-    //make sure to get this one as well and move to the next
-    if (popped > id) {
-        if (id_tracker::is_valid(popped)) {
-            job_queue.push(pending_job_t(popped, output_id));
-            added++;
-        }
-    }
-}
-
-void output_multi_t::pending_relation(osmid_t id, int exists)
+void output_multi_t::pending_relation(osmid_t id)
 {
     // Try to fetch the relation from the DB
     buffer.clear();
-    if (m_mid->relations_get(id, buffer)) {
+    if (m_mid->relation_get(id, buffer)) {
         auto const &rel = buffer.get<osmium::Relation>(0);
-        process_relation(rel, exists);
+        process_relation(rel, true);
     }
 }
 
-void output_multi_t::stop(osmium::thread::Pool *pool)
+void output_multi_t::stop(thread_pool_t *pool)
 {
     pool->submit([this]() {
         m_table->stop(m_options.slim & !m_options.droptemp,
@@ -191,7 +96,7 @@ void output_multi_t::stop(osmium::thread::Pool *pool)
     }
 }
 
-void output_multi_t::commit() { m_table->commit(); }
+void output_multi_t::sync() { m_table->sync(); }
 
 void output_multi_t::node_add(osmium::Node const &node)
 {
@@ -212,7 +117,7 @@ void output_multi_t::relation_add(osmium::Relation const &rel)
 {
     if (m_processor->interests(geometry_processor::interest_relation) &&
         !rel.members().empty()) {
-        process_relation(rel, 0);
+        process_relation(rel, false);
     }
 }
 
@@ -299,17 +204,11 @@ void output_multi_t::reprocess_way(osmium::Way *way, bool exists)
     if (m_processor->interests(geometry_processor::interest_relation) &&
         exists) {
         way_delete(way->id());
-        const std::vector<osmid_t> rel_ids =
-            m_mid->relations_using_way(way->id());
-        for (std::vector<osmid_t>::const_iterator itr = rel_ids.begin();
-             itr != rel_ids.end(); ++itr) {
-            rels_pending_tracker.mark(*itr);
-        }
     }
 
     //check if we are keeping this way
     taglist_t outtags;
-    unsigned int filter =
+    auto const filter =
         m_tagtransform->filter_tags(*way, nullptr, nullptr, outtags, true);
     if (!filter) {
         m_mid->nodes_get_list(&(way->nodes()));
@@ -324,7 +223,7 @@ void output_multi_t::process_way(osmium::Way *way)
 {
     //check if we are keeping this way
     taglist_t outtags;
-    auto filter =
+    auto const filter =
         m_tagtransform->filter_tags(*way, nullptr, nullptr, outtags, true);
     if (!filter) {
         //get the geom from the middle
@@ -332,18 +231,10 @@ void output_multi_t::process_way(osmium::Way *way)
             return;
         }
         //grab its geom
-        auto geom = m_processor->process_way(*way, &m_builder);
+        auto const geom = m_processor->process_way(*way, &m_builder);
 
         if (!geom.empty()) {
-            //if we are also interested in relations we need to mark
-            //this way pending just in case it shows up in one
-            if (m_processor->interests(geometry_processor::interest_relation)) {
-                ways_pending_tracker.mark(way->id());
-            } else {
-                // We wouldn't be interested in this as a relation, so no need to mark it pending.
-                // TODO: Does this imply anything for non-multipolygon relations?
-                copy_to_table(way->id(), geom, outtags);
-            }
+            copy_to_table(way->id(), geom, outtags);
         }
     }
 }
@@ -380,9 +271,9 @@ void output_multi_t::process_relation(osmium::Relation const &rel, bool exists)
             &make_boundary, &make_polygon, &roads, outtags, true);
         if (!filter) {
             m_relation_helper.add_way_locations(m_mid.get());
-            auto geoms = m_processor->process_relation(
+            auto const geoms = m_processor->process_relation(
                 rel, m_relation_helper.data, &m_builder);
-            for (const auto geom : geoms) {
+            for (auto const &geom : geoms) {
                 copy_to_table(-rel.id(), geom, outtags);
             }
         }
@@ -404,7 +295,7 @@ void output_multi_t::copy_node_to_table(osmid_t id, std::string const &geom,
  *
  * \pre geom must be valid.
  */
-void output_multi_t::copy_to_table(const osmid_t id,
+void output_multi_t::copy_to_table(osmid_t const id,
                                    geometry_processor::wkb_t const &geom,
                                    taglist_t &tags)
 {
@@ -414,9 +305,8 @@ void output_multi_t::copy_to_table(const osmid_t id,
         // and it got formed into a polygon, so expire as a polygon and write the geom
         auto area =
             ewkb::parser_t(geom).get_area<osmium::geom::IdentityProjection>();
-        char tmp[32];
-        snprintf(tmp, sizeof(tmp), "%g", area);
-        tags.set("way_area", tmp);
+        util::double_to_buffer tmp{area};
+        tags.set("way_area", tmp.c_str());
     }
 
     m_expire.from_wkb(geom.c_str(), id);
@@ -430,22 +320,9 @@ void output_multi_t::delete_from_output(osmid_t id)
     }
 }
 
-void output_multi_t::merge_pending_relations(output_t *other)
-{
-    auto *omulti = dynamic_cast<output_multi_t *>(other);
-
-    if (omulti) {
-        osmid_t id;
-        while (id_tracker::is_valid(
-            (id = omulti->rels_pending_tracker.pop_mark()))) {
-            rels_pending_tracker.mark(id);
-        }
-    }
-}
-
 void output_multi_t::merge_expire_trees(output_t *other)
 {
-    auto *omulti = dynamic_cast<output_multi_t *>(other);
+    auto *const omulti = dynamic_cast<output_multi_t *>(other);
 
     if (omulti) {
         m_expire.merge_and_destroy(omulti->m_expire);

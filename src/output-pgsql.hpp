@@ -8,7 +8,6 @@
 
 #include "db-copy.hpp"
 #include "expire-tiles.hpp"
-#include "id-tracker.hpp"
 #include "osmium-builder.hpp"
 #include "output.hpp"
 #include "table.hpp"
@@ -36,23 +35,19 @@ public:
     output_pgsql_t(std::shared_ptr<middle_query_t> const &mid,
                    options_t const &options,
                    std::shared_ptr<db_copy_thread_t> const &copy_thread);
-    virtual ~output_pgsql_t();
+
+    ~output_pgsql_t() override;
 
     std::shared_ptr<output_t>
     clone(std::shared_ptr<middle_query_t> const &mid,
           std::shared_ptr<db_copy_thread_t> const &copy_thread) const override;
 
     void start() override;
-    void stop(osmium::thread::Pool *pool) override;
-    void commit() override;
+    void stop(thread_pool_t *pool) override;
+    void sync() override;
 
-    void enqueue_ways(pending_queue_t &job_queue, osmid_t id, size_t output_id,
-                      size_t &added) override;
-    void pending_way(osmid_t id, int exists) override;
-
-    void enqueue_relations(pending_queue_t &job_queue, osmid_t id,
-                           size_t output_id, size_t &added) override;
-    void pending_relation(osmid_t id, int exists) override;
+    void pending_way(osmid_t id) override;
+    void pending_relation(osmid_t id) override;
 
     void node_add(osmium::Node const &node) override;
     void way_add(osmium::Way *way) override;
@@ -66,9 +61,6 @@ public:
     void way_delete(osmid_t id) override;
     void relation_delete(osmid_t id) override;
 
-    size_t pending_count() const override;
-
-    void merge_pending_relations(output_t *other) override;
     void merge_expire_trees(output_t *other) override;
 
 protected:
@@ -81,15 +73,13 @@ protected:
     std::unique_ptr<tagtransform_t> m_tagtransform;
 
     //enable output of a generated way_area tag to either hstore or its own column
-    int m_enable_way_area;
+    bool m_enable_way_area;
 
     std::array<std::unique_ptr<table_t>, t_MAX> m_tables;
 
     geom::osmium_builder_t m_builder;
     expire_tiles expire;
 
-    id_tracker ways_pending_tracker, rels_pending_tracker;
-    std::shared_ptr<id_tracker> ways_done_tracker;
     osmium::memory::Buffer buffer;
     osmium::memory::Buffer rels_buffer;
 };

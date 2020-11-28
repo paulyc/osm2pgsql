@@ -1,12 +1,14 @@
 # osm2pgsql #
 
+https://osm2pgsql.org
+
 osm2pgsql is a tool for loading OpenStreetMap data into a PostgreSQL / PostGIS
 database suitable for applications like rendering into a map, geocoding with
 Nominatim, or general analysis.
 
-[![Travis Build Status](https://secure.travis-ci.org/openstreetmap/osm2pgsql.svg?branch=master)](https://travis-ci.org/openstreetmap/osm2pgsql)
-[![Appveyor Build status](https://ci.appveyor.com/api/projects/status/7abwls7hfmb83axj/branch/master?svg=true)](https://ci.appveyor.com/project/openstreetmap/osm2pgsql/branch/master)
-[![Packaging status](https://repology.org/badge/tiny-repos/osm2pgsql.svg)](https://repology.org/project/osm2pgsql/versions)
+[![Appveyor Build Status](https://ci.appveyor.com/api/projects/status/7abwls7hfmb83axj/branch/master?svg=true)](https://ci.appveyor.com/project/openstreetmap/osm2pgsql/branch/master)
+[![Github Actions Build Status](https://github.com/openstreetmap/osm2pgsql/workflows/CI/badge.svg?branch=master)](https://github.com/openstreetmap/osm2pgsql/actions)
+[![Packaging Status](https://repology.org/badge/tiny-repos/osm2pgsql.svg)](https://repology.org/project/osm2pgsql/versions)
 
 ## Features ##
 
@@ -47,7 +49,8 @@ Required libraries are
 * [zlib](https://www.zlib.net/)
 * [Boost libraries](https://www.boost.org/), including system and filesystem
 * [PostgreSQL](https://www.postgresql.org/) client libraries
-* [Lua](https://www.lua.org/) (Optional, used for [Lua tag transforms](docs/lua.md))
+* [Lua](https://www.lua.org/) (Optional, used for Lua tag transforms
+  and the flex output)
 * [Python](https://python.org/) (only for running tests)
 * [Psycopg](http://initd.org/psycopg/) (only for running tests)
 
@@ -59,6 +62,9 @@ Make sure you have installed the development packages for the libraries
 mentioned in the requirements section and a C++ compiler which supports C++11.
 GCC 5 and later and Clang 3.5 and later are known to work.
 
+To rebuild the included man page you'll need the [pandoc](https://pandoc.org/)
+tool.
+
 First install the dependencies.
 
 On a Debian or Ubuntu system, this can be done with:
@@ -66,14 +72,14 @@ On a Debian or Ubuntu system, this can be done with:
 ```sh
 sudo apt-get install make cmake g++ libboost-dev libboost-system-dev \
   libboost-filesystem-dev libexpat1-dev zlib1g-dev \
-  libbz2-dev libpq-dev libproj-dev lua5.2 liblua5.2-dev
+  libbz2-dev libpq-dev libproj-dev lua5.3 liblua5.3-dev pandoc
 ```
 
 On a Fedora system, use
 
 ```sh
 sudo dnf install cmake make gcc-c++ boost-devel expat-devel zlib-devel \
-  bzip2-devel postgresql-devel proj-devel proj-epsg lua-devel
+  bzip2-devel postgresql-devel proj-devel proj-epsg lua-devel pandoc
 ```
 
 On RedHat / CentOS first run `sudo yum install epel-release` then install
@@ -81,7 +87,7 @@ dependencies with:
 
 ```sh
 sudo yum install cmake make gcc-c++ boost-devel expat-devel zlib-devel \
-  bzip2-devel postgresql-devel proj-devel proj-epsg lua-devel
+  bzip2-devel postgresql-devel proj-devel proj-epsg lua-devel pandoc
 ```
 
 On a FreeBSD system, use
@@ -123,8 +129,11 @@ cmake .. -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTS=ON
 
 ## Usage ##
 
-Osm2pgsql has one program, the executable itself, which has **43** command line
-options.
+This is only a short introduction. There is extensive documentation available
+on [osm2pgsq.org](https://osm2pgsql.org/doc/).
+
+Osm2pgsql has one program, the executable itself, which has a lot of command
+line options.
 
 Before loading into a database, the database must be created and the PostGIS
 and optional hstore extensions must be loaded. A full guide to PostgreSQL
@@ -154,7 +163,7 @@ osm2pgsql -c -d gis --slim -C <cache size> \
 ```
 where
 * `<cache size>` is about 75% of memory in MiB, to a maximum of about 30000. Additional RAM will not be used.
-* `<flat nodes>` is a location where a 36GiB+ file can be saved.
+* `<flat nodes>` is a location where a 50GiB+ file can be saved.
 
 Many different data files (e.g., .pbf) can be found at [planet.osm.org](https://planet.osm.org/).
 
@@ -162,19 +171,34 @@ The databases from either of these commands can be used immediately by
 [Mapnik](https://mapnik.org/) for rendering maps with standard tools like
 [renderd/mod_tile](https://github.com/openstreetmap/mod_tile),
 [TileMill](https://tilemill-project.github.io/tilemill/), [Nik4](https://github.com/Zverik/Nik4),
-among others. It can also be used for [spatial analysis](docs/analysis.md) or
-[shapefile exports](docs/export.md).
+among others.
 
-[Additional documentation is available on writing command lines](docs/usage.md).
+## Alternate outputs (backends) ##
 
-## Alternate backends ##
+In addition to the standard pgsql output designed for rendering there is also
+the gazetteer output for geocoding, principally with
+[Nominatim](https://www.nominatim.org/), and the null output for testing.
 
-In addition to the standard [pgsql](docs/pgsql.md) backend designed for
-rendering there is also the [gazetteer](docs/gazetteer.md) database for
-geocoding, principally with [Nominatim](https://www.nominatim.org/), and the
-null backend for testing. For flexibility a new [multi](docs/multi.md)
-backend is also available which allows the configuration of custom
-PostgreSQL tables instead of those provided in the pgsql backend.
+Also available is the new flex output. It is much more flexible than the other
+outputs. IT IS CURRENTLY EXPERIMENTAL AND SUBJECT TO CHANGE. The flex output is
+only available if you have compiled osm2pgsql with Lua support.
+
+## Projection Support ##
+
+Osm2pgsql has builtin support for the Latlong (WGS84, EPSG:4326) and the
+WebMercator (EPSG:3857) projection. If you need other projections you have to
+compile with the PROJ library.
+
+Both the older API (PROJ version 4) and the newer API (PROJ version 6.1 and
+above) are supported. Usually the CMake configuration will find a suitable
+version and use it automatically, but you can set the `USE_PROJ_LIB` CMake
+cache variable to choose between the following behaviours:
+
+* `4`: Look for PROJ library with API version 4. If it is not found, stop with error.
+* `6`: Look for PROJ library with API version 6. If it is not found, stop with error.
+* `off`: Build without PROJ library.
+* `auto`: Choose API 4 if available, otherwise API 6. If both are not available
+  build without PROJ library. (This is the default.)
 
 ## LuaJIT support ##
 
@@ -199,10 +223,10 @@ Use `osm2pgsql --version` to verify that the build includes LuaJIT support:
 
 ```sh
 ./osm2pgsql --version
-osm2pgsql version 0.96.0 (64 bit id space)
+osm2pgsql version 1.2.0
 
 Compiled using the following library versions:
-Libosmium 2.15.0
+Libosmium 2.15.6
 Lua 5.1.4 (LuaJIT 2.1.0-beta3)
 ```
 

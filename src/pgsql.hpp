@@ -1,11 +1,20 @@
 #ifndef OSM2PGSQL_PGSQL_HPP
 #define OSM2PGSQL_PGSQL_HPP
 
-/* Helper functions for PostgreSQL access */
+/**
+ * \file
+ *
+ * This file is part of osm2pgsql (https://github.com/openstreetmap/osm2pgsql).
+ *
+ * Helper classes and functions for PostgreSQL access.
+ */
+
+#include "osmtypes.hpp"
 
 #include <libpq-fe.h>
 
 #include <cassert>
+#include <map>
 #include <memory>
 #include <string>
 
@@ -64,14 +73,15 @@ public:
      */
     std::string get_value_as_string(int row, int col) const noexcept
     {
-        return std::string(get_value(row, col), get_length(row, col));
+        return std::string(get_value(row, col),
+                           (std::size_t)get_length(row, col));
     }
 
     /**
      * Get the column number from the name. Returns -1 if there is no column
      * of that name.
      */
-    int get_column_number(std::string const& name) const noexcept
+    int get_column_number(std::string const &name) const noexcept
     {
         return PQfnumber(m_result.get(), ('"' + name + '"').c_str());
     }
@@ -90,20 +100,31 @@ private:
  *
  * Wraps the PGconn object of the libpq library.
  *
- * The connection is automatically closed when the object is destroyed.
+ * The connection is automatically closed when the object is destroyed or
+ * you can close it explicitly by calling close().
  */
 class pg_conn_t
 {
 public:
     explicit pg_conn_t(std::string const &conninfo);
 
-    pg_result_t exec_prepared(char const *stmt, int num_params,
-                              const char *const *param_values,
-                              ExecStatusType expect = PGRES_TUPLES_OK) const;
+    /// Execute a prepared statement with one parameter.
+    pg_result_t exec_prepared(char const *stmt, char const *param) const;
+
+    /// Execute a prepared statement with two parameters.
+    pg_result_t exec_prepared(char const *stmt, char const *p1, char const *p2) const;
+
+    /// Execute a prepared statement with one string parameter.
+    pg_result_t exec_prepared(char const *stmt, std::string const &param) const;
+
+    /// Execute a prepared statement with one integer parameter.
+    pg_result_t exec_prepared(char const *stmt, osmid_t id) const;
 
     pg_result_t query(ExecStatusType expect, char const *sql) const;
 
     pg_result_t query(ExecStatusType expect, std::string const &sql) const;
+
+    void set_config(char const *setting, char const *value) const;
 
     void exec(char const *sql) const;
 
@@ -115,7 +136,13 @@ public:
 
     char const *error_msg() const noexcept;
 
+    /// Close database connection.
+    void close() noexcept { m_conn.reset(); }
+
 private:
+    pg_result_t exec_prepared_internal(char const *stmt, int num_params,
+                                       char const *const *param_values) const;
+
     struct pg_conn_deleter_t
     {
         void operator()(PGconn *p) const noexcept { PQfinish(p); }
@@ -123,5 +150,30 @@ private:
 
     std::unique_ptr<PGconn, pg_conn_deleter_t> m_conn;
 };
+
+/**
+ * Return a TABLESPACE clause with the specified tablespace name or an empty
+ * string if the name is empty.
+ */
+std::string tablespace_clause(std::string const &name);
+
+/**
+ * Return the possibly schema-qualified name of a table. Names are enclosed
+ * in double quotes.
+ */
+std::string qualified_name(std::string const &schema, std::string const &name);
+
+struct postgis_version
+{
+    int major;
+    int minor;
+};
+
+/// Get all config settings from the database.
+std::map<std::string, std::string>
+get_postgresql_settings(pg_conn_t const &db_connection);
+
+/// Get PostGIS major and minor version.
+postgis_version get_postgis_version(pg_conn_t const &db_connection);
 
 #endif // OSM2PGSQL_PGSQL_HPP

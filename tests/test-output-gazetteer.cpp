@@ -1,8 +1,8 @@
 #include <catch.hpp>
 
 #include <random>
-#include <vector>
 #include <utility>
+#include <vector>
 
 #include "common-import.hpp"
 #include "common-options.hpp"
@@ -12,7 +12,7 @@ static testing::db::import_t db;
 // Use a random device with a fixed seed. We don't really care about
 // the quality of random numbers here, we just need to generate valid
 // OSM test data. The fixed seed ensures that the results are reproducible.
-static std::mt19937_64 rng(47382);
+static std::mt19937_64 rng{47382}; // NOLINT(cert-msc32-c)
 
 class node_opl_t
 {
@@ -121,7 +121,7 @@ public:
                        id);
     }
 
-    void del(osmid_t id) { fmt::format_to(m_way_opl, "r{} v2 dD\n", id); }
+    void del(osmid_t id) { fmt::format_to(m_rel_opl, "r{} v2 dD\n", id); }
 
     std::string get_and_clear_opl()
     {
@@ -186,7 +186,7 @@ public:
 
     void update()
     {
-        auto opt = testing::opt_t().gazetteer().slim().append();
+        auto const opt = testing::opt_t().gazetteer().slim().append();
         std::string const opl = m_opl_factory.get_and_clear_opl();
         REQUIRE_NOTHROW(db.run_import(opt, opl.c_str()));
     }
@@ -303,9 +303,9 @@ TEMPLATE_TEST_CASE("Main tags", "", node_importer_t, way_importer_t,
         CHECK(1 == t.obj_count(conn, 2, "railway"));
         CHECK(1 == t.obj_count(conn, 3, "amenity"));
 
-        t.del(3);
         t.add(1, "not_a=restaurant");
         t.add(2, "highway=bus_stop,name=X");
+        t.del(3);
 
         t.update();
 

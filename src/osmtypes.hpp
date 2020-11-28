@@ -1,27 +1,27 @@
 #ifndef OSM2PGSQL_OSMTYPES_HPP
 #define OSM2PGSQL_OSMTYPES_HPP
 
-/* Data types to hold OSM node, segment, way data */
-
-// when __cplusplus is defined, we need to define this macro as well
-// to get the print format specifiers in the inttypes.h header.
-#define __STDC_FORMAT_MACROS
-#include <cinttypes>
+/**
+ * \file
+ *
+ * This file is part of osm2pgsql (https://github.com/openstreetmap/osm2pgsql).
+ *
+ * In this file some basic (OSM) data types are defined.
+ */
 
 #include <algorithm>
-#include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <limits>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <osmium/builder/attr.hpp>
 #include <osmium/geom/coordinates.hpp>
 #include <osmium/osm.hpp>
 
-typedef int64_t osmid_t;
-#define strtoosmid strtoll
-#define PRIdOSMID PRId64
-#define POSTGRES_OSMID_TYPE "int8"
+using osmid_t = std::int64_t;
 
 struct member
 {
@@ -29,7 +29,7 @@ struct member
     osmid_t id;
     std::string role;
 
-    operator osmium::builder::attr::member_type const() const
+    explicit operator osmium::builder::attr::member_type const() const
     {
         return osmium::builder::attr::member_type(type, id, role.c_str());
     }
@@ -41,8 +41,6 @@ struct member
 
 struct memberlist_t : public std::vector<member>
 {
-    memberlist_t() {}
-
     explicit memberlist_t(osmium::RelationMemberList const &list)
     {
         for (auto const &m : list) {
@@ -66,7 +64,7 @@ struct tag_t
     std::string key;
     std::string value;
 
-    operator std::pair<char const *, char const *> const() const
+    operator std::pair<char const *, char const *> const() const noexcept
     {
         return std::pair<char const *, char const *>(key.c_str(),
                                                      value.c_str());
@@ -234,7 +232,12 @@ private:
 
 struct idlist_t : public std::vector<osmid_t>
 {
-    idlist_t() {}
+    // Get all constructors from std::vector
+    using vector<osmid_t>::vector;
+
+    // Even though we got all constructors from std::vector we need this on
+    // some compilers/libraries for some reason.
+    idlist_t() = default;
 
     explicit idlist_t(osmium::NodeRefList const &list)
     {
@@ -244,6 +247,6 @@ struct idlist_t : public std::vector<osmid_t>
     }
 };
 
-typedef std::vector<char const *> rolelist_t;
+using rolelist_t = std::vector<char const *>;
 
 #endif // OSM2PGSQL_OSMTYPES_HPP

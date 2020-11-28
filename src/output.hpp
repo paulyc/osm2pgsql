@@ -10,27 +10,13 @@
  * Associated tags: name, type etc.
 */
 
-#include <stack>
-
-#include <osmium/thread/pool.hpp>
+#include <osmium/index/id_set.hpp>
 
 #include "options.hpp"
+#include "thread-pool.hpp"
 
-struct expire_tiles;
-struct id_tracker;
 struct middle_query_t;
 class db_copy_thread_t;
-
-struct pending_job_t
-{
-    osmid_t osm_id;
-    size_t output_id;
-
-    pending_job_t() : osm_id(0), output_id(0) {}
-    pending_job_t(osmid_t id, size_t oid) : osm_id(id), output_id(oid) {}
-};
-
-typedef std::stack<pending_job_t> pending_queue_t;
 
 class output_t
 {
@@ -48,16 +34,22 @@ public:
           std::shared_ptr<db_copy_thread_t> const &copy_thread) const = 0;
 
     virtual void start() = 0;
-    virtual void stop(osmium::thread::Pool *pool) = 0;
-    virtual void commit() = 0;
+    virtual void stop(thread_pool_t *pool) = 0;
+    virtual void sync() = 0;
 
-    virtual void enqueue_ways(pending_queue_t &job_queue, osmid_t id,
-                              size_t output_id, size_t &added) = 0;
-    virtual void pending_way(osmid_t id, int exists) = 0;
+    virtual osmium::index::IdSetSmall<osmid_t> const &get_marked_way_ids()
+    {
+        static osmium::index::IdSetSmall<osmid_t> const ids{};
+        return ids;
+    }
 
-    virtual void enqueue_relations(pending_queue_t &job_queue, osmid_t id,
-                                   size_t output_id, size_t &added) = 0;
-    virtual void pending_relation(osmid_t id, int exists) = 0;
+    virtual void reprocess_marked() {}
+
+    virtual void pending_way(osmid_t id) = 0;
+    virtual void pending_relation(osmid_t id) = 0;
+    virtual void pending_relation_stage1c(osmid_t) {}
+
+    virtual void select_relation_members(osmid_t) {}
 
     virtual void node_add(osmium::Node const &node) = 0;
     virtual void way_add(osmium::Way *way) = 0;
@@ -71,11 +63,8 @@ public:
     virtual void way_delete(osmid_t id) = 0;
     virtual void relation_delete(osmid_t id) = 0;
 
-    virtual size_t pending_count() const;
-
     const options_t *get_options() const;
 
-    virtual void merge_pending_relations(output_t *other);
     virtual void merge_expire_trees(output_t *other);
 
 protected:
